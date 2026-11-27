@@ -495,6 +495,12 @@ impl MpvPlayer {
         self.cmd_sync(&["screenshot-to-file", path, "video"]);
     }
 
+    pub fn effective_rotate(&self) -> i64 {
+        let vp_rot = self.get_int64("video-params/rotate");
+        let user_rot = self.get_int64("video-rotate");
+        (vp_rot + user_rot).rem_euclid(360)
+    }
+
     pub fn toggle_pause(&self) {
         self.cmd_async(&["cycle", "pause"]);
     }

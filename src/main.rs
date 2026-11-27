@@ -1052,10 +1052,17 @@ impl StreamdApp {
                     .unwrap_or(0)
             ));
             mpv.screenshot_to_file(&tmp.to_string_lossy());
+            let rot = mpv.effective_rotate();
             let bytes = std::fs::read(&tmp).ok();
             let _ = std::fs::remove_file(&tmp);
             if let Some(bytes) = bytes {
-                if let Ok(img) = image::load_from_memory(&bytes) {
+                if let Ok(mut img) = image::load_from_memory(&bytes) {
+                    img = match rot {
+                        90 => img.rotate90(),
+                        180 => img.rotate180(),
+                        270 => img.rotate270(),
+                        _ => img,
+                    };
                     let rgba = img.to_rgba8();
                     let ci = ColorImage::from_rgba_unmultiplied(
                         [rgba.width() as usize, rgba.height() as usize],
@@ -1441,11 +1448,11 @@ impl StreamdApp {
         self.hdrs_anim += (target_h - self.hdrs_anim) * (dt * 14.0).min(1.0);
 
         let home_el = self.home_entered_at.elapsed().as_secs_f32();
-        let center_refl_fade = smoothstep((home_el / 0.34).clamp(0.0, 1.0));
-        let start_over_fade = smoothstep(((home_el - 0.14) / 0.28).clamp(0.0, 1.0));
+        let center_refl_fade = smoothstep((home_el / 0.65).clamp(0.0, 1.0));
+        let start_over_fade = smoothstep(((home_el - 0.22) / 0.45).clamp(0.0, 1.0));
         if (self.carousel_pos - target_f).abs() > 0.002
             || (self.hdrs_anim - target_h).abs() > 0.002
-            || home_el < 0.45
+            || home_el < 0.72
         {
             ctx.request_repaint();
         }
@@ -1901,36 +1908,38 @@ impl StreamdApp {
                             );
                         }
 
-                        // "Start Over" softly fades in after closing morph finishes!
+                        // Text-only "Start Over" (NO box!) softly fading in after closing morph finishes
                         let mut clicked_start_over = false;
                         if is_center && item.position > 3.0 && start_over_fade > 0.02 {
                             let so_r = Rect::from_min_size(
-                                Pos2::new(cr.right() - 92.0, cr.top() + 10.0),
-                                Vec2::new(82.0, 26.0),
+                                Pos2::new(cr.right() - 84.0, cr.top() + 10.0),
+                                Vec2::new(72.0, 24.0),
                             );
                             let so_resp = ui.interact(
                                 so_r,
                                 egui::Id::new(("cf_start_over", idx)),
                                 Sense::click(),
                             );
-                            let bg_a = ((if so_resp.hovered() { 185.0 } else { 130.0 })
+                            let txt_a = ((if so_resp.hovered() { 255.0 } else { 195.0 })
                                 * start_over_fade) as u8;
-                            ui.painter().rect_filled(
-                                so_r,
-                                CornerRadius::ZERO,
-                                Color32::from_rgba_unmultiplied(0, 0, 0, bg_a),
+                            ui.painter().text(
+                                so_r.center() + Vec2::new(0.0, 1.0),
+                                Align2::CENTER_CENTER,
+                                "Start Over",
+                                FontId::proportional(12.5),
+                                Color32::from_rgba_unmultiplied(
+                                    0,
+                                    0,
+                                    0,
+                                    (160.0 * start_over_fade) as u8,
+                                ),
                             );
                             ui.painter().text(
                                 so_r.center(),
                                 Align2::CENTER_CENTER,
                                 "Start Over",
-                                FontId::proportional(12.0),
-                                Color32::from_rgba_unmultiplied(
-                                    255,
-                                    255,
-                                    255,
-                                    (255.0 * start_over_fade) as u8,
-                                ),
+                                FontId::proportional(12.5),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, txt_a),
                             );
                             if so_resp.clicked() {
                                 clicked_start_over = true;
@@ -2772,11 +2781,30 @@ impl StreamdApp {
                             self.request_thumb(bucket, ctx);
 
                             if self.hover_t > 0.02 {
-                                let ha = expo_out(self.hover_t);
-                                let pw = 180.0;
-                                let ph = 101.0;
+                                let ha = smoothstep(self.hover_t);
+                                // Dynamic aspect-accurate hover preview (portrait stays portrait, landscape stays landscape!)
+                                let preview_aspect = if let Some((_, tex)) = &self.active_thumb {
+                                    tex.aspect_ratio()
+                                } else if self.snap.width > 0 && self.snap.height > 0 {
+                                    self.snap.width as f32 / self.snap.height as f32
+                                } else {
+                                    16.0 / 9.0
+                                };
+                                let (img_w, img_h) = if preview_aspect >= 1.0 {
+                                    let w = 184.0_f32;
+                                    (w, (w / preview_aspect).clamp(64.0, 150.0))
+                                } else {
+                                    let h = 156.0_f32;
+                                    ((h * preview_aspect).clamp(64.0, 156.0), h)
+                                };
+                                let pw = img_w + 6.0;
+                                let ph = img_h + 6.0;
+                                let half_w = pw * 0.5;
+                                let px = self
+                                    .hover_x_smooth
+                                    .clamp(scrub_rect.left() + half_w, scrub_rect.right() - half_w);
                                 let box_r = Rect::from_min_size(
-                                    Pos2::new(self.hover_x_smooth - pw * 0.5, scrub_y - ph - 32.0),
+                                    Pos2::new(px - half_w, scrub_y - ph - 32.0),
                                     Vec2::new(pw, ph + 20.0),
                                 );
                                 sp.rect_filled(
@@ -2786,7 +2814,7 @@ impl StreamdApp {
                                 );
                                 let img_r = Rect::from_min_size(
                                     box_r.min + Vec2::new(3.0, 3.0),
-                                    Vec2::new(pw - 6.0, ph - 6.0),
+                                    Vec2::new(img_w, img_h),
                                 );
                                 if let Some((_, tex)) = &self.active_thumb {
                                     sp.image(
@@ -3314,6 +3342,43 @@ impl StreamdApp {
                                                                     m.set_aspect_mode(id);
                                                                 }
                                                             }
+                                                        }
+                                                    }
+                                                });
+                                                ui.add_space(6.0);
+                                                ui.label(
+                                                    egui::RichText::new("Rotate")
+                                                        .size(11.5)
+                                                        .color(Color32::from_gray(145)),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing =
+                                                        Vec2::new(4.0, 0.0);
+                                                    let bw = (row_w - 12.0) / 4.0;
+                                                    for deg in [0, 90, 180, 270] {
+                                                        let active = self.snap.rotate == deg;
+                                                        if ui
+                                                            .add_sized(
+                                                                Vec2::new(bw, 26.0),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(format!(
+                                                                        "{deg}°"
+                                                                    ))
+                                                                    .size(11.5)
+                                                                    .color(if active {
+                                                                        Color32::WHITE
+                                                                    } else {
+                                                                        Color32::from_gray(130)
+                                                                    }),
+                                                                )
+                                                                .fill(Color32::TRANSPARENT),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Some(m) = &mpv {
+                                                                m.set_video_rotate(deg);
+                                                            }
+                                                            self.flash(format!("{deg}°"));
                                                         }
                                                     }
                                                 });
