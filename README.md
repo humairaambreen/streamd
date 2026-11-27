@@ -1,26 +1,41 @@
 # streamd
 
-Cross-platform (macOS, Windows, Linux) pure-Rust GPU video player. Paste a direct video link—or open/drop a local or partial `.part`/`.crdownload` file—and play immediately on GPU while downloading in 24 parallel chunks. Closing the app wipes all temporary data.
+Native Rust GPU video player for macOS, Windows, and Linux. Paste a direct link—or drop a local / `.part` / `.crdownload` file—and play immediately on GPU while downloading in parallel. Close the app and all temporary data is gone.
 
-## Features
-- **Zero-remux hardware playback** via `libmpv` OpenGL GPU rendering (`MKV`, `MP4`, `1080p`/`4K`, `HEVC`, `10-bit`, `HDR`, `AC3`/`EAC3`/`DTS`, `ASS`/`SRT`/`PGS`).
-- **24-connection parallel chunk engine** (`1 MiB` chunks, urgent seek queue, EOF prefetch, sequential `200 OK` fallback, automatic `403` retry cascade).
-- **Local & partial download playback**: open or drag-and-drop any local video or `.part`/`.crdownload` file, or attach a partial file to resume downloading with its URL.
-- **Subtitles**: upload local `.srt`/`.vtt`/`.ass` files (or drag-and-drop), adjust timing offset, subtitle speed (`sub-speed`), and scale, or search & load subtitles online with zero API key.
-- **Self-contained releases**: GitHub Actions builds standalone bundles with `libmpv` included for macOS (`arm64` & `x64`), Windows (`x64`), and Linux (`x64`).
+## Architecture
 
-## Build from Source
+```mermaid
+flowchart TB
+    A[Remote Video URL / Local .part] --> B[HTTP Probe & 403 Fallback Cascade]
+    B -->|206 Partial Content| C[32x Parallel Workers · 512 KiB Chunks]
+    B -->|200 OK| D[Sequential Stream Fallback]
+    C --> E[Lock-Free Positional Disk Cache .part]
+    D --> E
+    E --> F[Local Loopback RFC 7233 Range Server]
+    F --> G[libmpv Dynamic Loader · hwdec GPU Decode]
+    G --> H[OpenGL Framebuffer · mpv_render_context]
+    H --> I[eframe / egui 120fps Borderless GPU UI]
+    F -->|bg=1, kill_on_drop| J[Keyframe Thumbnail Extractor]
+    J --> I
+```
+
+### Core Internals
+- **Chunk Engine (`src/engine.rs`)**: Probes with native OS TLS + HTTP/2 and a 5-step `403` fallback cascade. Splits files into `512 KiB` chunks across `32` concurrent workers with an urgent seek priority queue, immediate EOF prefetch (for MP4 `moov` / MKV `Cues`), and lock-free positional I/O (`pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows).
+- **GPU Video (`src/mpv.rs`)**: Loads `libmpv` dynamically at runtime (`libloading`)—zero C build scripts—and renders hardware-decoded frames (`VideoToolbox` on macOS, `D3D11VA` on Windows, `VAAPI` on Linux) directly into the OpenGL framebuffer with zero remuxing.
+- **UI (`src/main.rs`)**: Pure Rust `eframe`/`egui` (`glow`) with custom vector icons, vertex-interpolated fade scrims, headless hairline seekbars (timeline, volume, boost, subtitle delay/speed/size), drag-and-drop local/subtitle support, and free zero-key online subtitle search.
+- **Ephemeral Lifecycle**: Exiting the app terminates `mpv`, aborts all workers, and deletes every temporary `.part` and subtitle file.
+
+## Install
+
+Download a self-contained build (includes `libmpv`) from [Releases](../../releases):
+- **macOS**: `streamd-macos-arm64.zip` (`streamd.app`)
+- **Windows**: `streamd-windows-x64.zip` (`streamd.exe` + `libmpv-2.dll`)
+- **Linux**: `streamd-linux-x64.tar.gz` (`streamd` + `libmpv.so.2`)
+
+### Build from Source
 ```sh
-# macOS
-brew install mpv
-cargo run --release
-
-# Windows: place libmpv-2.dll next to streamd.exe
 cargo run --release
 ```
 
-## Controls
-- `Space` / `K` — Play / Pause
-- `←` / `→` / `J` / `L` — Seek ±10s
-- `↑` / `↓` — Volume ±5% (up to 300%)
-- `M` — Mute · `F` — Fullscreen · `C` — Subtitles · `0`–`9` — Jump 0–90%
+## Shortcuts
+`Space`/`K` Play · `←`/`→`/`J`/`L` ±10s · `↑`/`↓` Volume (up to 300%) · `M` Mute · `F` Fullscreen · `C` Subtitles · `0`–`9` Jump 0–90%

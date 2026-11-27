@@ -31,8 +31,8 @@ use tokio::{
 };
 
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-const CONNS: usize = 24;
-const CHUNK_BYTES: u64 = 1 << 20; // 1 MiB chunks for instant seek & preview latency
+const CONNS: usize = 32;
+const CHUNK_BYTES: u64 = 512 << 10; // 512 KiB chunks for ultra-low seek & preview latency
 const AHEAD_BYTES: u64 = 512 << 20; // 512 MiB prefetch window ahead of playhead
 const READ_SLICE: usize = 256 * 1024;
 
@@ -1071,17 +1071,24 @@ impl Engine {
         })
     }
 
-    /// Fast keyframe thumbnail extractor (works for both remote sessions and local files).
+    /// Fast, immediately cancellable keyframe thumbnail extractor.
     pub fn fetch_thumb(
         &self,
         id: &str,
         local_path: Option<&str>,
         bucket_sec: u64,
+        gen_arc: &Arc<AtomicU64>,
+        expected_gen: u64,
     ) -> Option<Bytes> {
         let sess_map = self.sess.clone();
         let id = id.to_string();
         let local_owned = local_path.map(str::to_string);
+        let gen_check = gen_arc.clone();
+
         self.rt.block_on(async move {
+            if gen_check.load(Relaxed) != expected_gen {
+                return None;
+            }
             let (input_src, sess_opt) = if let Some(lp) = local_owned {
                 (lp, None)
             } else {
@@ -1104,15 +1111,18 @@ impl Engine {
             };
 
             let _permit = self.thumb_sem.acquire().await.ok()?;
+            if gen_check.load(Relaxed) != expected_gen {
+                return None;
+            }
             let mut cmd = Command::new("ffmpeg");
             cmd.args([
                 "-v",
                 "error",
                 "-noaccurate_seek",
                 "-analyzeduration",
-                "200000",
+                "150000",
                 "-probesize",
-                "300000",
+                "250000",
                 "-ss",
                 &bucket_sec.to_string(),
                 "-i",
@@ -1123,7 +1133,7 @@ impl Engine {
                 "-frames:v",
                 "1",
                 "-q:v",
-                "9",
+                "10",
                 "-vf",
                 "scale=240:-2",
                 "-f",
@@ -1132,7 +1142,21 @@ impl Engine {
             ])
             .stdin(Stdio::null())
             .kill_on_drop(true);
-            let out = cmd.output().await.ok()?;
+
+            let cancel_fut = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    if gen_check.load(Relaxed) != expected_gen {
+                        break;
+                    }
+                }
+            };
+
+            let out = tokio::select! {
+                res = cmd.output() => res.ok()?,
+                _ = cancel_fut => return None,
+            };
+
             if out.status.success() && !out.stdout.is_empty() {
                 let b = Bytes::from(out.stdout);
                 if let Some(s) = sess_opt {

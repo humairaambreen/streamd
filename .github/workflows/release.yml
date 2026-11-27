@@ -20,7 +20,7 @@ jobs:
       - name: Build Windows release
         run: cargo build --release
 
-      - name: Download bundled libmpv-2.dll
+      - name: Bundle libmpv-2.dll
         shell: pwsh
         run: |
           $rel = Invoke-RestMethod "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
@@ -40,15 +40,7 @@ jobs:
           path: streamd-windows-x64.zip
 
   build-macos:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            arch: arm64
-          - os: macos-13
-            arch: x64
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -66,14 +58,12 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
           cp target/release/streamd "$APP/Contents/MacOS/streamd"
 
-          # Generate .icns from assets/icon.png
           mkdir -p icon.iconset
           for sz in 16 32 128 256 512; do
             sips -z $sz $sz assets/icon.png --out "icon.iconset/icon_${sz}x${sz}.png" >/dev/null
           done
           iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
 
-          # Bundle libmpv and its transitive dylibs inside Contents/Frameworks
           MPV_LIB="$(brew --prefix mpv)/lib/libmpv.2.dylib"
           cp -L "$MPV_LIB" "$APP/Contents/Frameworks/libmpv.2.dylib"
           chmod +w "$APP/Contents/Frameworks/libmpv.2.dylib"
@@ -90,8 +80,8 @@ jobs:
             <key>CFBundleExecutable</key><string>streamd</string>
             <key>CFBundleIdentifier</key><string>com.streamd.app</string>
             <key>CFBundleName</key><string>streamd</string>
-            <key>CFBundleVersion</key><string>0.3.0</string>
-            <key>CFBundleShortVersionString</key><string>0.3.0</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
             <key>CFBundleIconFile</key><string>icon.icns</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict>
@@ -99,12 +89,12 @@ jobs:
           EOF
 
           codesign --force --deep --sign - "$APP"
-          (cd dist && zip -r "../streamd-macos-${{ matrix.arch }}.zip" streamd.app)
+          (cd dist && zip -r "../streamd-macos-arm64.zip" streamd.app)
 
       - uses: actions/upload-artifact@v4
         with:
-          name: streamd-macos-${{ matrix.arch }}
-          path: streamd-macos-${{ matrix.arch }}.zip
+          name: streamd-macos-arm64
+          path: streamd-macos-arm64.zip
 
   build-linux:
     runs-on: ubuntu-latest

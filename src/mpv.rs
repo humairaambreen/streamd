@@ -324,8 +324,13 @@ impl MpvPlayer {
         set_opt("hwdec", "auto-safe");
         set_opt("keep-open", "yes");
         set_opt("cache", "yes");
+        set_opt("cache-pause-initial", "no");
+        set_opt("cache-pause-wait", "0.5");
+        set_opt("demuxer-readahead-secs", "60");
         set_opt("demuxer-max-bytes", "128MiB");
         set_opt("demuxer-max-back-bytes", "64MiB");
+        set_opt("hr-seek", "no");
+        set_opt("vd-lavc-fast", "yes");
         set_opt("volume-max", "300");
         set_opt("osc", "no");
         set_opt("osd-level", "0");

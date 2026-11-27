@@ -4,8 +4,8 @@ mod mpv;
 use eframe::{
     egui::{
         self, Align, Align2, Color32, ColorImage, CornerRadius, FontId, IconData, Key, Layout,
-        Margin, PaintCallback, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
-        ViewportCommand,
+        Margin, Mesh, PaintCallback, Pos2, Rect, Sense, Shape, Stroke, TextureHandle,
+        TextureOptions, Vec2, ViewportCommand,
     },
     egui_glow,
 };
@@ -22,12 +22,6 @@ use std::{
 };
 
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
-
-const PAUSE_LINES: [&str; 3] = [
-    "Paused — press Space to resume.",
-    "Still buffering quietly in the background.",
-    "Take five. Ready whenever you are.",
-];
 
 fn expo_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -139,6 +133,308 @@ fn is_sub_ext(path: &std::path::Path) -> bool {
     )
 }
 
+// ---------- Smooth GPU vertex-interpolated fade gradients (zero banding lines!) ----------
+fn paint_fade_v(p: &egui::Painter, rect: Rect, top_col: Color32, bot_col: Color32) {
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top_col);
+    mesh.colored_vertex(rect.right_top(), top_col);
+    mesh.colored_vertex(rect.right_bottom(), bot_col);
+    mesh.colored_vertex(rect.left_bottom(), bot_col);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(Shape::mesh(mesh));
+}
+
+fn paint_fade_h(p: &egui::Painter, rect: Rect, left_col: Color32, right_col: Color32) {
+    let mut mesh = Mesh::default();
+    mesh.colored_vertex(rect.left_top(), left_col);
+    mesh.colored_vertex(rect.right_top(), right_col);
+    mesh.colored_vertex(rect.right_bottom(), right_col);
+    mesh.colored_vertex(rect.left_bottom(), left_col);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(Shape::mesh(mesh));
+}
+
+// ---------- Crisp custom vector icons (zero missing-glyph boxes on any OS!) ----------
+fn icon_btn(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    draw: impl FnOnce(&egui::Painter, Rect, Color32),
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::ZERO,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+        );
+    }
+    let col = if resp.hovered() {
+        Color32::WHITE
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 220)
+    };
+    draw(ui.painter(), rect, col);
+    resp
+}
+
+fn draw_play(p: &egui::Painter, r: Rect, col: Color32) {
+    let c = r.center();
+    let pts = vec![
+        Pos2::new(c.x - 4.5, c.y - 6.0),
+        Pos2::new(c.x + 6.5, c.y),
+        Pos2::new(c.x - 4.5, c.y + 6.0),
+    ];
+    p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
+}
+
+fn draw_pause(p: &egui::Painter, r: Rect, col: Color32) {
+    let c = r.center();
+    p.rect_filled(
+        Rect::from_min_size(Pos2::new(c.x - 5.0, c.y - 6.0), Vec2::new(3.2, 12.0)),
+        CornerRadius::ZERO,
+        col,
+    );
+    p.rect_filled(
+        Rect::from_min_size(Pos2::new(c.x + 1.8, c.y - 6.0), Vec2::new(3.2, 12.0)),
+        CornerRadius::ZERO,
+        col,
+    );
+}
+
+fn draw_speaker(p: &egui::Painter, r: Rect, col: Color32, muted: bool) {
+    let c = r.center();
+    let cone = vec![
+        Pos2::new(c.x - 6.5, c.y - 2.5),
+        Pos2::new(c.x - 3.0, c.y - 2.5),
+        Pos2::new(c.x + 1.0, c.y - 6.0),
+        Pos2::new(c.x + 1.0, c.y + 6.0),
+        Pos2::new(c.x - 3.0, c.y + 2.5),
+        Pos2::new(c.x - 6.5, c.y + 2.5),
+    ];
+    p.add(Shape::convex_polygon(cone, col, Stroke::NONE));
+    let st = Stroke::new(1.5_f32, col);
+    if muted {
+        p.line_segment(
+            [
+                Pos2::new(c.x + 3.0, c.y - 3.0),
+                Pos2::new(c.x + 7.5, c.y + 3.0),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x + 7.5, c.y - 3.0),
+                Pos2::new(c.x + 3.0, c.y + 3.0),
+            ],
+            st,
+        );
+    } else {
+        p.line_segment(
+            [
+                Pos2::new(c.x + 3.8, c.y - 3.0),
+                Pos2::new(c.x + 3.8, c.y + 3.0),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x + 6.8, c.y - 5.0),
+                Pos2::new(c.x + 6.8, c.y + 5.0),
+            ],
+            st,
+        );
+    }
+}
+
+fn draw_fullscreen(p: &egui::Painter, r: Rect, col: Color32, exit: bool) {
+    let c = r.center();
+    let s = 5.5;
+    let d = 3.5;
+    let st = Stroke::new(1.5_f32, col);
+    if !exit {
+        // Outward 4 corners
+        p.line_segment(
+            [Pos2::new(c.x - s, c.y - s + d), Pos2::new(c.x - s, c.y - s)],
+            st,
+        );
+        p.line_segment(
+            [Pos2::new(c.x - s, c.y - s), Pos2::new(c.x - s + d, c.y - s)],
+            st,
+        );
+        p.line_segment(
+            [Pos2::new(c.x + s - d, c.y - s), Pos2::new(c.x + s, c.y - s)],
+            st,
+        );
+        p.line_segment(
+            [Pos2::new(c.x + s, c.y - s), Pos2::new(c.x + s, c.y - s + d)],
+            st,
+        );
+        p.line_segment(
+            [Pos2::new(c.x - s, c.y + s - d), Pos2::new(c.x - s, c.y + s)],
+            st,
+        );
+        p.line_segment(
+            [Pos2::new(c.x - s, c.y + s), Pos2::new(c.x - s + d, c.y + s)],
+            st,
+        );
+        p.line_segment(
+            [Pos2::new(c.x + s - d, c.y + s), Pos2::new(c.x + s, c.y + s)],
+            st,
+        );
+        p.line_segment(
+            [Pos2::new(c.x + s, c.y + s), Pos2::new(c.x + s, c.y + s - d)],
+            st,
+        );
+    } else {
+        // Inward 4 corners
+        p.line_segment(
+            [
+                Pos2::new(c.x - s, c.y - 2.0),
+                Pos2::new(c.x - 2.0, c.y - 2.0),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x - 2.0, c.y - 2.0),
+                Pos2::new(c.x - 2.0, c.y - s),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x + s, c.y - 2.0),
+                Pos2::new(c.x + 2.0, c.y - 2.0),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x + 2.0, c.y - 2.0),
+                Pos2::new(c.x + 2.0, c.y - s),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x - s, c.y + 2.0),
+                Pos2::new(c.x - 2.0, c.y + 2.0),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x - 2.0, c.y + 2.0),
+                Pos2::new(c.x - 2.0, c.y + s),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x + s, c.y + 2.0),
+                Pos2::new(c.x + 2.0, c.y + 2.0),
+            ],
+            st,
+        );
+        p.line_segment(
+            [
+                Pos2::new(c.x + 2.0, c.y + 2.0),
+                Pos2::new(c.x + 2.0, c.y + s),
+            ],
+            st,
+        );
+    }
+}
+
+fn draw_back(p: &egui::Painter, r: Rect, col: Color32) {
+    let c = r.center();
+    let st = Stroke::new(1.6_f32, col);
+    p.line_segment(
+        [Pos2::new(c.x + 3.0, c.y - 5.5), Pos2::new(c.x - 3.0, c.y)],
+        st,
+    );
+    p.line_segment(
+        [Pos2::new(c.x - 3.0, c.y), Pos2::new(c.x + 3.0, c.y + 5.5)],
+        st,
+    );
+}
+
+fn draw_menu(p: &egui::Painter, r: Rect, col: Color32) {
+    let c = r.center();
+    let st = Stroke::new(1.5_f32, col);
+    for dy in [-4.0, 0.0, 4.0] {
+        p.line_segment(
+            [
+                Pos2::new(c.x - 6.5, c.y + dy),
+                Pos2::new(c.x + 6.5, c.y + dy),
+            ],
+            st,
+        );
+    }
+}
+
+// ---------- Unified headless hairline seekbar (no circle knob!) ----------
+fn hairline_bar(
+    ui: &mut egui::Ui,
+    _id: &str,
+    width: f32,
+    val: f64,
+    min: f64,
+    max: f64,
+    center_tick: Option<f64>,
+) -> Option<f64> {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 20.0), Sense::click_and_drag());
+    let hovered = resp.hovered() || resp.dragged();
+    let rail_h = if hovered { 4.0 } else { 2.0 };
+    let rail = Rect::from_min_size(
+        Pos2::new(rect.left(), rect.center().y - rail_h * 0.5),
+        Vec2::new(rect.width(), rail_h),
+    );
+    let p = ui.painter();
+    p.rect_filled(
+        rail,
+        CornerRadius::ZERO,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+    );
+
+    let span = (max - min).max(1e-6);
+    let norm = ((val - min) / span).clamp(0.0, 1.0) as f32;
+
+    if let Some(mid) = center_tick {
+        let mid_norm = ((mid - min) / span).clamp(0.0, 1.0) as f32;
+        let x0 = rail.left() + rail.width() * mid_norm.min(norm);
+        let x1 = rail.left() + rail.width() * mid_norm.max(norm);
+        p.rect_filled(
+            Rect::from_min_max(Pos2::new(x0, rail.top()), Pos2::new(x1, rail.bottom())),
+            CornerRadius::ZERO,
+            Color32::WHITE,
+        );
+        // Crisp center zero tick
+        let cx = rail.left() + rail.width() * mid_norm;
+        p.rect_filled(
+            Rect::from_center_size(Pos2::new(cx, rail.center().y), Vec2::new(1.5, 8.0)),
+            CornerRadius::ZERO,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 130),
+        );
+    } else {
+        p.rect_filled(
+            Rect::from_min_size(rail.min, Vec2::new(rail.width() * norm, rail_h)),
+            CornerRadius::ZERO,
+            Color32::WHITE,
+        );
+    }
+
+    if (resp.clicked() || resp.dragged()) && rect.width() > 0.0 {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let p_norm = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+            return Some(min + span * p_norm);
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OptTab {
     Audio,
@@ -196,14 +492,13 @@ struct StreamdApp {
     chrome_t: f32,
     pause_t: f32,
     pause_since: Option<Instant>,
-    pause_line_idx: usize,
     opts_open: bool,
     opts_t: f32,
     opt_tab: OptTab,
     tab_slide_x: f32,
     is_fullscreen: bool,
 
-    // HUD toast
+    // Text-only HUD (no box!)
     hud_text: Option<String>,
     hud_until: Instant,
 
@@ -213,7 +508,7 @@ struct StreamdApp {
     thumb_rx: mpsc::Receiver<(u64, ColorImage)>,
     thumb_tx: mpsc::Sender<(u64, ColorImage)>,
     last_thumb_bucket: i64,
-    active_thumb: Option<TextureHandle>,
+    active_thumb: Option<(u64, TextureHandle)>,
     hover_x_smooth: f32,
     hover_t: f32,
 }
@@ -223,7 +518,7 @@ impl StreamdApp {
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(Color32::WHITE);
         visuals.panel_fill = Color32::BLACK;
-        visuals.window_fill = Color32::from_rgba_unmultiplied(10, 10, 12, 210);
+        visuals.window_fill = Color32::from_rgba_unmultiplied(10, 10, 12, 220);
         visuals.window_stroke = Stroke::NONE;
         visuals.window_corner_radius = CornerRadius::ZERO;
         visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
@@ -233,10 +528,10 @@ impl StreamdApp {
         visuals.widgets.inactive.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 16);
         visuals.widgets.hovered.bg_stroke = Stroke::NONE;
         visuals.widgets.hovered.corner_radius = CornerRadius::ZERO;
-        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 32);
+        visuals.widgets.hovered.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 28);
         visuals.widgets.active.bg_stroke = Stroke::NONE;
         visuals.widgets.active.corner_radius = CornerRadius::ZERO;
-        visuals.widgets.active.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 48);
+        visuals.widgets.active.weak_bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 42);
         visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 55);
         visuals.selection.stroke = Stroke::NONE;
         cc.egui_ctx.set_visuals(visuals);
@@ -295,7 +590,6 @@ impl StreamdApp {
             chrome_t: 1.0,
             pause_t: 0.0,
             pause_since: None,
-            pause_line_idx: 0,
             opts_open: false,
             opts_t: 0.0,
             opt_tab: OptTab::Audio,
@@ -316,14 +610,13 @@ impl StreamdApp {
 
     fn flash(&mut self, msg: impl Into<String>) {
         self.hud_text = Some(msg.into());
-        self.hud_until = Instant::now() + Duration::from_millis(850);
+        self.hud_until = Instant::now() + Duration::from_millis(750);
     }
 
     fn start_open_url(&mut self) {
         if self.opening || self.url.trim().is_empty() {
             return;
         }
-        // Allow pasting a local file path directly into the URL bar too
         let trimmed = self.url.trim();
         let maybe_path = PathBuf::from(trimmed.strip_prefix("file://").unwrap_or(trimmed));
         if maybe_path.is_file() {
@@ -371,6 +664,7 @@ impl StreamdApp {
     }
 
     fn close_session(&mut self) {
+        self.thumb_gen.fetch_add(1, Relaxed);
         if let Some(mpv) = &self.mpv {
             mpv.stop();
         }
@@ -410,12 +704,18 @@ impl StreamdApp {
 
     fn request_thumb(&mut self, bucket: u64, ctx: &egui::Context) {
         if let Some(tex) = self.thumb_cache.get(&bucket) {
-            self.active_thumb = Some(tex.clone());
+            self.active_thumb = Some((bucket, tex.clone()));
             self.last_thumb_bucket = bucket as i64;
             return;
         }
         if self.last_thumb_bucket == bucket as i64 {
             return;
+        }
+        // Clear stale preview if it's more than 30s away so it never looks stuck on an old frame
+        if let Some((b, _)) = &self.active_thumb {
+            if b.abs_diff(bucket) > 30 {
+                self.active_thumb = None;
+            }
         }
         self.last_thumb_bucket = bucket as i64;
         let Some(sess) = &self.session else { return };
@@ -428,10 +728,9 @@ impl StreamdApp {
         let egui_ctx = ctx.clone();
 
         std::thread::spawn(move || {
-            if gen_arc.load(Relaxed) != my_gen {
-                return;
-            }
-            if let Some(jpeg) = eng.fetch_thumb(&id, local_path.as_deref(), bucket) {
+            if let Some(jpeg) =
+                eng.fetch_thumb(&id, local_path.as_deref(), bucket, &gen_arc, my_gen)
+            {
                 if gen_arc.load(Relaxed) != my_gen {
                     return;
                 }
@@ -563,7 +862,6 @@ impl StreamdApp {
                         );
                     });
 
-                    // Sharp, zero-border URL bar + Play button
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         let btn_w = 88.0;
@@ -659,7 +957,6 @@ impl StreamdApp {
                                         .margin(Margin::symmetric(12, 9)),
                                 );
                             }
-                            // Optional partial/cancelled download file to resume from
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
                                 let pick_seed = egui::Button::new(
@@ -684,7 +981,7 @@ impl StreamdApp {
                                             .color(Color32::from_gray(160)),
                                     );
                                     if ui
-                                        .add(egui::Button::new("✕").fill(Color32::TRANSPARENT))
+                                        .add(egui::Button::new("x").fill(Color32::TRANSPARENT))
                                         .clicked()
                                     {
                                         self.seed_file = None;
@@ -736,7 +1033,6 @@ impl StreamdApp {
             self.last_status_poll = Instant::now();
         }
 
-        // Poll async online subtitle search & downloads
         if let Some(rx) = &self.sub_search_rx {
             if let Ok(res) = rx.try_recv() {
                 self.sub_search_rx = None;
@@ -778,7 +1074,7 @@ impl StreamdApp {
             }
             self.thumb_cache.insert(bucket, tex.clone());
             if self.last_thumb_bucket == bucket as i64 {
-                self.active_thumb = Some(tex);
+                self.active_thumb = Some((bucket, tex));
             }
         }
 
@@ -799,14 +1095,13 @@ impl StreamdApp {
         if self.snap.paused && !self.opts_open {
             if self.pause_since.is_none() {
                 self.pause_since = Some(Instant::now());
-                self.pause_line_idx = (self.pause_line_idx + 1) % PAUSE_LINES.len();
             }
         } else {
             self.pause_since = None;
         }
         let want_pause_overlay = self
             .pause_since
-            .map_or(false, |t| t.elapsed() > Duration::from_millis(320));
+            .map_or(false, |t| t.elapsed() > Duration::from_millis(260));
         let pause_target = if want_pause_overlay { 1.0 } else { 0.0 };
         self.pause_t += (pause_target - self.pause_t) * (dt * 9.0).min(1.0);
 
@@ -829,7 +1124,7 @@ impl StreamdApp {
             .show(ctx, |ui| {
                 let full_rect = ui.max_rect();
 
-                // 1. Hardware-decoded GPU video via libmpv OpenGL callback
+                // 1. Hardware-decoded GPU video via libmpv OpenGL
                 if let Some(mpv) = self.mpv.clone() {
                     let cb = egui_glow::CallbackFn::new(move |info, painter| {
                         let vp = info.viewport_in_pixels();
@@ -863,30 +1158,24 @@ impl StreamdApp {
 
                 let p = ui.painter();
 
-                // 2. Minimal Cinematic Pause Overlay
+                // 2. Smooth vertex-interpolated Pause Overlay (zero banding lines, zero cheesy text!)
                 let pe = expo_out(self.pause_t);
                 if pe > 0.01 {
-                    let steps = 18;
-                    let scrim_w = full_rect.width() * 0.65;
-                    for i in 0..steps {
-                        let f0 = i as f32 / steps as f32;
-                        let f1 = (i + 1) as f32 / steps as f32;
-                        let alpha = ((1.0 - f0).powf(1.8) * 195.0 * pe) as u8;
-                        let r = Rect::from_min_max(
-                            Pos2::new(full_rect.left() + scrim_w * f0, full_rect.top()),
-                            Pos2::new(full_rect.left() + scrim_w * f1, full_rect.bottom()),
-                        );
-                        p.rect_filled(
-                            r,
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
-                        );
-                    }
+                    let scrim = Rect::from_min_size(
+                        full_rect.min,
+                        Vec2::new(full_rect.width() * 0.65, full_rect.height()),
+                    );
+                    paint_fade_h(
+                        p,
+                        scrim,
+                        Color32::from_rgba_unmultiplied(0, 0, 0, (195.0 * pe) as u8),
+                        Color32::TRANSPARENT,
+                    );
 
                     let lx = full_rect.left() + (full_rect.width() * 0.07).max(40.0);
-                    let cy = full_rect.center().y - 36.0 + (1.0 - pe) * 14.0;
+                    let cy = full_rect.center().y - 20.0 + (1.0 - pe) * 12.0;
                     let a_hi = (255.0 * pe) as u8;
-                    let a_mid = (185.0 * pe) as u8;
+                    let a_mid = (180.0 * pe) as u8;
                     let a_dim = (115.0 * pe) as u8;
 
                     let res = res_label(self.snap.width, self.snap.height);
@@ -894,17 +1183,19 @@ impl StreamdApp {
                         (Some(y), false) => format!("{y} · {res}"),
                         (Some(y), true) => y.clone(),
                         (None, false) => res,
-                        (None, true) => "PLAYING".into(),
+                        (None, true) => String::new(),
                     };
+                    if !kicker.is_empty() {
+                        p.text(
+                            Pos2::new(lx, cy - 22.0),
+                            Align2::LEFT_CENTER,
+                            kicker,
+                            FontId::proportional(12.0),
+                            Color32::from_rgba_unmultiplied(255, 255, 255, a_dim),
+                        );
+                    }
                     p.text(
-                        Pos2::new(lx, cy - 22.0),
-                        Align2::LEFT_CENTER,
-                        kicker,
-                        FontId::proportional(12.0),
-                        Color32::from_rgba_unmultiplied(255, 255, 255, a_dim),
-                    );
-                    p.text(
-                        Pos2::new(lx, cy + 14.0),
+                        Pos2::new(lx, cy + 12.0),
                         Align2::LEFT_CENTER,
                         &self.title,
                         FontId::proportional(40.0),
@@ -913,37 +1204,31 @@ impl StreamdApp {
                     if self.snap.duration > 0.0 {
                         let rem = fmt_remaining((self.snap.duration - self.snap.position).max(0.0));
                         p.text(
-                            Pos2::new(lx, cy + 52.0),
+                            Pos2::new(lx, cy + 48.0),
                             Align2::LEFT_CENTER,
                             rem,
                             FontId::proportional(14.0),
                             Color32::from_rgba_unmultiplied(255, 255, 255, a_mid),
                         );
                     }
-                    p.text(
-                        Pos2::new(lx, cy + 78.0),
-                        Align2::LEFT_CENTER,
-                        PAUSE_LINES[self.pause_line_idx],
-                        FontId::proportional(13.0),
-                        Color32::from_rgba_unmultiplied(255, 255, 255, a_dim),
-                    );
                 }
 
-                // 3. Center HUD Toast
+                // 3. Text-only HUD (NO box!)
                 if let Some(txt) = &self.hud_text {
                     if Instant::now() < self.hud_until {
                         let c = full_rect.center();
-                        let box_r = Rect::from_center_size(c, Vec2::new(136.0, 38.0));
-                        p.rect_filled(
-                            box_r,
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+                        p.text(
+                            c + Vec2::new(0.0, 1.5),
+                            Align2::CENTER_CENTER,
+                            txt,
+                            FontId::proportional(20.0),
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 160),
                         );
                         p.text(
                             c,
                             Align2::CENTER_CENTER,
                             txt,
-                            FontId::proportional(14.5),
+                            FontId::proportional(20.0),
                             Color32::WHITE,
                         );
                         ctx.request_repaint();
@@ -952,41 +1237,26 @@ impl StreamdApp {
                     }
                 }
 
-                // 4. Top & Bottom Progressive Fade Scrims + Controls
+                // 4. Smooth Top & Bottom Fade Scrims + Controls
                 let ce = expo_out(self.chrome_t);
                 if ce > 0.01 {
-                    let top_h = 84.0;
-                    for i in 0..14 {
-                        let f0 = i as f32 / 14.0;
-                        let f1 = (i + 1) as f32 / 14.0;
-                        let alpha = ((1.0 - f0).powf(1.8) * 165.0 * ce) as u8;
-                        let r = Rect::from_min_max(
-                            Pos2::new(full_rect.left(), full_rect.top() + top_h * f0),
-                            Pos2::new(full_rect.right(), full_rect.top() + top_h * f1),
-                        );
-                        p.rect_filled(
-                            r,
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
-                        );
-                    }
+                    paint_fade_v(
+                        p,
+                        Rect::from_min_size(full_rect.min, Vec2::new(full_rect.width(), 88.0)),
+                        Color32::from_rgba_unmultiplied(0, 0, 0, (175.0 * ce) as u8),
+                        Color32::TRANSPARENT,
+                    );
+                    paint_fade_v(
+                        p,
+                        Rect::from_min_size(
+                            Pos2::new(full_rect.left(), full_rect.bottom() - 120.0),
+                            Vec2::new(full_rect.width(), 120.0),
+                        ),
+                        Color32::TRANSPARENT,
+                        Color32::from_rgba_unmultiplied(0, 0, 0, (205.0 * ce) as u8),
+                    );
 
-                    let bot_h = 116.0;
-                    for i in 0..16 {
-                        let f0 = i as f32 / 16.0;
-                        let f1 = (i + 1) as f32 / 16.0;
-                        let alpha = (f1.powf(1.8) * 195.0 * ce) as u8;
-                        let r = Rect::from_min_max(
-                            Pos2::new(full_rect.left(), full_rect.bottom() - bot_h + bot_h * f0),
-                            Pos2::new(full_rect.right(), full_rect.bottom() - bot_h + bot_h * f1),
-                        );
-                        p.rect_filled(
-                            r,
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(0, 0, 0, alpha),
-                        );
-                    }
-
+                    // Top bar
                     let top_bar = Rect::from_min_size(
                         Pos2::new(
                             full_rect.left() + 20.0,
@@ -997,15 +1267,12 @@ impl StreamdApp {
                     ui.scope_builder(egui::UiBuilder::new().max_rect(top_bar), |ui| {
                         ui.set_opacity(ce);
                         ui.horizontal(|ui| {
-                            let back = egui::Button::new(
-                                egui::RichText::new(format!("←  {}", self.title)).size(14.0),
-                            )
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE);
-                            if ui.add(back).clicked() {
+                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+                            if icon_btn(ui, Vec2::new(28.0, 28.0), draw_back).clicked() {
                                 self.close_session();
                                 return;
                             }
+                            ui.label(egui::RichText::new(&self.title).size(14.0));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let is_local = self.session.as_ref().map_or(false, |s| s.is_local);
                                 let stat_txt = if is_local {
@@ -1028,7 +1295,7 @@ impl StreamdApp {
                         });
                     });
 
-                    // Scrub bar
+                    // Video timeline scrub bar (headless hairline!)
                     let pad = 22.0;
                     let scrub_y = full_rect.bottom() - 56.0 + (1.0 - ce) * 10.0;
                     let scrub_rect = Rect::from_min_size(
@@ -1075,25 +1342,26 @@ impl StreamdApp {
                     } else {
                         0.0
                     };
-                    let fill_rect = Rect::from_min_size(
-                        rail_rect.min,
-                        Vec2::new(rail_rect.width() * pct, rail_h),
-                    );
                     sp.rect_filled(
-                        fill_rect,
+                        Rect::from_min_size(
+                            rail_rect.min,
+                            Vec2::new(rail_rect.width() * pct, rail_h),
+                        ),
                         CornerRadius::ZERO,
                         Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * ce) as u8),
                     );
 
                     if (scrub_resp.clicked() || scrub_resp.dragged()) && self.snap.duration > 0.0 {
                         if let Some(pos) = scrub_resp.interact_pointer_pos() {
-                            let p_norm = ((pos.x - scrub_rect.left()) / scrub_rect.width()).clamp(0.0, 1.0);
+                            let p_norm =
+                                ((pos.x - scrub_rect.left()) / scrub_rect.width()).clamp(0.0, 1.0);
                             if let Some(mpv) = &self.mpv {
                                 mpv.seek_absolute(self.snap.duration * p_norm as f64);
                             }
                         }
                     }
 
+                    // Hover preview (immediately cancels stale ffmpeg spawns when moving!)
                     let hover_target = if hovering_scrub && self.snap.duration > 0.0 {
                         1.0
                     } else {
@@ -1102,9 +1370,11 @@ impl StreamdApp {
                     self.hover_t += (hover_target - self.hover_t) * (dt * 16.0).min(1.0);
                     if hovering_scrub && self.snap.duration > 0.0 {
                         if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                            let p_norm = ((pos.x - scrub_rect.left()) / scrub_rect.width()).clamp(0.0, 1.0);
-                            let target_x =
-                                pos.x.clamp(scrub_rect.left() + 92.0, scrub_rect.right() - 92.0);
+                            let p_norm =
+                                ((pos.x - scrub_rect.left()) / scrub_rect.width()).clamp(0.0, 1.0);
+                            let target_x = pos
+                                .x
+                                .clamp(scrub_rect.left() + 92.0, scrub_rect.right() - 92.0);
                             if self.hover_x_smooth <= 1.0 {
                                 self.hover_x_smooth = target_x;
                             } else {
@@ -1132,18 +1402,28 @@ impl StreamdApp {
                                     box_r.min + Vec2::new(3.0, 3.0),
                                     Vec2::new(pw - 6.0, ph - 6.0),
                                 );
-                                if let Some(tex) = &self.active_thumb {
+                                if let Some((_, tex)) = &self.active_thumb {
                                     sp.image(
                                         tex.id(),
                                         img_r,
                                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * ha) as u8),
+                                        Color32::from_rgba_unmultiplied(
+                                            255,
+                                            255,
+                                            255,
+                                            (255.0 * ha) as u8,
+                                        ),
                                     );
                                 } else {
                                     sp.rect_filled(
                                         img_r,
                                         CornerRadius::ZERO,
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, (14.0 * ha) as u8),
+                                        Color32::from_rgba_unmultiplied(
+                                            255,
+                                            255,
+                                            255,
+                                            (14.0 * ha) as u8,
+                                        ),
                                     );
                                 }
                                 sp.text(
@@ -1151,13 +1431,21 @@ impl StreamdApp {
                                     Align2::CENTER_CENTER,
                                     fmt_time(hover_sec),
                                     FontId::proportional(11.5),
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, (220.0 * ha) as u8),
+                                    Color32::from_rgba_unmultiplied(
+                                        255,
+                                        255,
+                                        255,
+                                        (220.0 * ha) as u8,
+                                    ),
                                 );
                             }
                         }
+                    } else if self.last_thumb_bucket >= 0 {
+                        self.thumb_gen.fetch_add(1, Relaxed);
+                        self.last_thumb_bucket = -1;
                     }
 
-                    // Bottom controls row
+                    // Bottom controls row (vector icons + headless volume seekbar!)
                     let ctrl_rect = Rect::from_min_size(
                         Pos2::new(
                             full_rect.left() + pad,
@@ -1171,17 +1459,20 @@ impl StreamdApp {
                             ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
                             let mpv = self.mpv.clone();
 
-                            if ui
-                                .add(
-                                    egui::Button::new(if self.snap.paused { "▶" } else { "❚❚" })
-                                        .fill(Color32::TRANSPARENT),
-                                )
-                                .clicked()
+                            if icon_btn(ui, Vec2::new(30.0, 28.0), |p, r, c| {
+                                if self.snap.paused {
+                                    draw_play(p, r, c);
+                                } else {
+                                    draw_pause(p, r, c);
+                                }
+                            })
+                            .clicked()
                             {
                                 if let Some(m) = &mpv {
                                     m.toggle_pause();
                                 }
                             }
+
                             if ui
                                 .add(egui::Button::new("−10").fill(Color32::TRANSPARENT))
                                 .clicked()
@@ -1200,37 +1491,29 @@ impl StreamdApp {
                                 }
                                 self.flash("+10s");
                             }
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        if self.snap.muted || self.snap.volume < 0.5 {
-                                            "✕"
-                                        } else {
-                                            "♪"
-                                        },
-                                    )
-                                    .fill(Color32::TRANSPARENT),
-                                )
-                                .clicked()
+
+                            let is_muted = self.snap.muted || self.snap.volume < 0.5;
+                            if icon_btn(ui, Vec2::new(30.0, 28.0), |p, r, c| {
+                                draw_speaker(p, r, c, is_muted);
+                            })
+                            .clicked()
                             {
                                 if let Some(m) = &mpv {
                                     m.toggle_mute();
                                 }
                             }
 
-                            let mut vol = if self.snap.muted {
+                            // Headless hairline volume seekbar (matches video scrub bar!)
+                            let vol_cur = if self.snap.muted {
                                 0.0
                             } else {
-                                self.snap.volume as f32
+                                self.snap.volume
                             };
-                            let vol_resp = ui.add(
-                                egui::Slider::new(&mut vol, 0.0..=150.0)
-                                    .show_value(false)
-                                    .trailing_fill(true),
-                            );
-                            if vol_resp.changed() {
+                            if let Some(new_vol) =
+                                hairline_bar(ui, "vol_bar", 76.0, vol_cur, 0.0, 150.0, None)
+                            {
                                 if let Some(m) = &mpv {
-                                    m.set_volume(vol as f64);
+                                    m.set_volume(new_vol);
                                 }
                             }
 
@@ -1245,12 +1528,11 @@ impl StreamdApp {
                             );
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(if self.is_fullscreen { "⤡" } else { "⤢" })
-                                            .fill(Color32::TRANSPARENT),
-                                    )
-                                    .clicked()
+                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
+                                if icon_btn(ui, Vec2::new(30.0, 28.0), |p, r, c| {
+                                    draw_fullscreen(p, r, c, self.is_fullscreen);
+                                })
+                                .clicked()
                                 {
                                     self.is_fullscreen = !self.is_fullscreen;
                                     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(
@@ -1258,12 +1540,7 @@ impl StreamdApp {
                                     ));
                                 }
 
-                                let opt_bg = if self.opts_open {
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 34)
-                                } else {
-                                    Color32::TRANSPARENT
-                                };
-                                if ui.add(egui::Button::new("Options").fill(opt_bg)).clicked() {
+                                if icon_btn(ui, Vec2::new(30.0, 28.0), draw_menu).clicked() {
                                     self.opts_open = !self.opts_open;
                                 }
                             });
@@ -1271,11 +1548,11 @@ impl StreamdApp {
                     });
                 }
 
-                // 5. Borderless Morphing Options Sheet
+                // 5. Clean Borderless Morphing Options Sheet (all headless hairline seekbars!)
                 let oe = expo_out(self.opts_t);
                 if oe > 0.01 {
-                    let ow = 310.0;
-                    let oh = 290.0;
+                    let ow = 316.0;
+                    let oh = 310.0;
                     let ox = full_rect.right() - 22.0 - ow;
                     let oy = full_rect.bottom() - 68.0 - oh + (1.0 - oe) * 10.0;
                     let orect = Rect::from_min_size(Pos2::new(ox, oy), Vec2::new(ow, oh));
@@ -1283,18 +1560,17 @@ impl StreamdApp {
                     ui.painter().rect_filled(
                         orect,
                         CornerRadius::ZERO,
-                        Color32::from_rgba_unmultiplied(12, 12, 14, (224.0 * oe) as u8),
+                        Color32::from_rgba_unmultiplied(10, 10, 12, (232.0 * oe) as u8),
                     );
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(orect), |ui| {
                         ui.set_opacity(oe);
-                        let tab_h = 34.0;
+                        let tab_h = 36.0;
                         let tab_w = ow / 3.0;
-                        let tab_bar = Rect::from_min_size(orect.min, Vec2::new(ow, tab_h));
                         ui.painter().rect_filled(
-                            tab_bar,
+                            Rect::from_min_size(orect.min, Vec2::new(ow, tab_h)),
                             CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 8),
                         );
 
                         ui.horizontal(|ui| {
@@ -1307,7 +1583,7 @@ impl StreamdApp {
                                 let col = if self.opt_tab == tab {
                                     Color32::WHITE
                                 } else {
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 125)
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 115)
                                 };
                                 let b = egui::Button::new(
                                     egui::RichText::new(label).size(12.0).color(col),
@@ -1326,18 +1602,19 @@ impl StreamdApp {
                             ),
                             Vec2::new(tab_w, 1.5),
                         );
-                        ui.painter().rect_filled(slide_r, CornerRadius::ZERO, Color32::WHITE);
+                        ui.painter()
+                            .rect_filled(slide_r, CornerRadius::ZERO, Color32::WHITE);
 
                         let body_rect = Rect::from_min_size(
-                            Pos2::new(orect.left() + 8.0, orect.top() + tab_h + 6.0),
-                            Vec2::new(ow - 16.0, oh - tab_h - 12.0),
+                            Pos2::new(orect.left() + 14.0, orect.top() + tab_h + 10.0),
+                            Vec2::new(ow - 28.0, oh - tab_h - 20.0),
                         );
                         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 5.0);
-                                    let row_w = ow - 24.0;
+                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                    let row_w = ow - 32.0;
                                     let mpv = self.mpv.clone();
 
                                     match self.opt_tab {
@@ -1346,29 +1623,34 @@ impl StreamdApp {
                                                 ui.label(
                                                     egui::RichText::new("Default audio")
                                                         .size(12.0)
-                                                        .color(Color32::from_gray(140)),
+                                                        .color(Color32::from_gray(130)),
                                                 );
                                             }
                                             for tr in self.snap.audio_tracks.clone() {
                                                 let active = tr.id == self.snap.active_aid;
-                                                let txt = if active {
-                                                    format!("●  {}", tr.display_label())
+                                                let fill = if active {
+                                                    Color32::from_rgba_unmultiplied(
+                                                        255, 255, 255, 18,
+                                                    )
                                                 } else {
-                                                    tr.display_label()
+                                                    Color32::TRANSPARENT
+                                                };
+                                                let col = if active {
+                                                    Color32::WHITE
+                                                } else {
+                                                    Color32::from_rgba_unmultiplied(
+                                                        255, 255, 255, 175,
+                                                    )
                                                 };
                                                 if ui
                                                     .add_sized(
-                                                        Vec2::new(row_w, 26.0),
+                                                        Vec2::new(row_w, 28.0),
                                                         egui::Button::new(
-                                                            egui::RichText::new(txt).size(12.5),
+                                                            egui::RichText::new(tr.display_label())
+                                                                .size(12.5)
+                                                                .color(col),
                                                         )
-                                                        .fill(if active {
-                                                            Color32::from_rgba_unmultiplied(
-                                                                255, 255, 255, 20,
-                                                            )
-                                                        } else {
-                                                            Color32::TRANSPARENT
-                                                        }),
+                                                        .fill(fill),
                                                     )
                                                     .clicked()
                                                 {
@@ -1378,38 +1660,50 @@ impl StreamdApp {
                                                     self.flash(tr.display_label());
                                                 }
                                             }
-                                            ui.add_space(6.0);
+                                            ui.add_space(10.0);
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     egui::RichText::new("Boost")
                                                         .size(12.0)
-                                                        .color(Color32::from_gray(180)),
+                                                        .color(Color32::from_gray(150)),
                                                 );
-                                                let mut v = self.snap.volume as f32;
-                                                if ui
-                                                    .add(
-                                                        egui::Slider::new(&mut v, 100.0..=300.0)
-                                                            .suffix("%"),
-                                                    )
-                                                    .changed()
-                                                {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_volume(v as f64);
-                                                    }
-                                                }
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{:.0}%",
+                                                                self.snap.volume.max(100.0)
+                                                            ))
+                                                            .size(12.0),
+                                                        );
+                                                    },
+                                                );
                                             });
+                                            if let Some(v) = hairline_bar(
+                                                ui,
+                                                "boost_bar",
+                                                row_w,
+                                                self.snap.volume.max(100.0),
+                                                100.0,
+                                                300.0,
+                                                None,
+                                            ) {
+                                                if let Some(m) = &mpv {
+                                                    m.set_volume(v);
+                                                }
+                                            }
                                         }
                                         OptTab::Subs => {
-                                            // Upload local subtitle file
                                             if ui
                                                 .add_sized(
                                                     Vec2::new(row_w, 28.0),
                                                     egui::Button::new(
-                                                        egui::RichText::new("+ Upload Subtitle (.srt / .vtt / .ass)")
+                                                        egui::RichText::new("+ Upload Subtitle")
                                                             .size(12.0),
                                                     )
                                                     .fill(Color32::from_rgba_unmultiplied(
-                                                        255, 255, 255, 20,
+                                                        255, 255, 255, 18,
                                                     )),
                                                 )
                                                 .clicked()
@@ -1431,18 +1725,19 @@ impl StreamdApp {
                                             let off_active = self.snap.active_sid <= 0;
                                             if ui
                                                 .add_sized(
-                                                    Vec2::new(row_w, 24.0),
+                                                    Vec2::new(row_w, 26.0),
                                                     egui::Button::new(
-                                                        egui::RichText::new(if off_active {
-                                                            "●  Off"
-                                                        } else {
-                                                            "Off"
-                                                        })
-                                                        .size(12.0),
+                                                        egui::RichText::new("Off")
+                                                            .size(12.0)
+                                                            .color(if off_active {
+                                                                Color32::WHITE
+                                                            } else {
+                                                                Color32::from_gray(165)
+                                                            }),
                                                     )
                                                     .fill(if off_active {
                                                         Color32::from_rgba_unmultiplied(
-                                                            255, 255, 255, 20,
+                                                            255, 255, 255, 18,
                                                         )
                                                     } else {
                                                         Color32::TRANSPARENT
@@ -1456,20 +1751,21 @@ impl StreamdApp {
                                             }
                                             for tr in self.snap.sub_tracks.clone() {
                                                 let active = tr.id == self.snap.active_sid;
-                                                let txt = if active {
-                                                    format!("●  {}", tr.display_label())
-                                                } else {
-                                                    tr.display_label()
-                                                };
                                                 if ui
                                                     .add_sized(
-                                                        Vec2::new(row_w, 24.0),
+                                                        Vec2::new(row_w, 26.0),
                                                         egui::Button::new(
-                                                            egui::RichText::new(txt).size(12.0),
+                                                            egui::RichText::new(tr.display_label())
+                                                                .size(12.0)
+                                                                .color(if active {
+                                                                    Color32::WHITE
+                                                                } else {
+                                                                    Color32::from_gray(165)
+                                                                }),
                                                         )
                                                         .fill(if active {
                                                             Color32::from_rgba_unmultiplied(
-                                                                255, 255, 255, 20,
+                                                                255, 255, 255, 18,
                                                             )
                                                         } else {
                                                             Color32::TRANSPARENT
@@ -1483,96 +1779,146 @@ impl StreamdApp {
                                                 }
                                             }
 
-                                            ui.add_space(4.0);
+                                            ui.add_space(6.0);
+                                            // Headless hairline seekbar for Subtitle Delay (-10s .. +10s)
                                             ui.horizontal(|ui| {
                                                 ui.label(
-                                                    egui::RichText::new("Offset")
+                                                    egui::RichText::new("Delay")
                                                         .size(12.0)
-                                                        .color(Color32::from_gray(170)),
+                                                        .color(Color32::from_gray(150)),
                                                 );
-                                                if ui.button("−0.5").clicked() {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_delay(self.snap.sub_delay - 0.5);
-                                                    }
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{:.1}s",
-                                                        self.snap.sub_delay
-                                                    ))
-                                                    .size(12.0),
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(format!(
+                                                                        "{:+.1}s",
+                                                                        self.snap.sub_delay
+                                                                    ))
+                                                                    .size(12.0),
+                                                                )
+                                                                .fill(Color32::TRANSPARENT),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Some(m) = &mpv {
+                                                                m.set_sub_delay(0.0);
+                                                            }
+                                                        }
+                                                    },
                                                 );
-                                                if ui.button("+0.5").clicked() {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_delay(self.snap.sub_delay + 0.5);
-                                                    }
-                                                }
                                             });
+                                            if let Some(d) = hairline_bar(
+                                                ui,
+                                                "sub_delay_bar",
+                                                row_w,
+                                                self.snap.sub_delay,
+                                                -10.0,
+                                                10.0,
+                                                Some(0.0),
+                                            ) {
+                                                let snapped = (d * 10.0).round() / 10.0;
+                                                if let Some(m) = &mpv {
+                                                    m.set_sub_delay(snapped);
+                                                }
+                                            }
+
+                                            // Headless hairline seekbar for Subtitle Speed (0.90x .. 1.10x)
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     egui::RichText::new("Speed")
                                                         .size(12.0)
-                                                        .color(Color32::from_gray(170)),
+                                                        .color(Color32::from_gray(150)),
                                                 );
-                                                if ui.button("−0.01").clicked() {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_speed(self.snap.sub_speed - 0.01);
-                                                    }
-                                                }
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            egui::RichText::new(format!(
-                                                                "{:.2}×",
-                                                                self.snap.sub_speed
-                                                            ))
-                                                            .size(12.0),
-                                                        )
-                                                        .fill(Color32::TRANSPARENT),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_speed(1.0);
-                                                    }
-                                                }
-                                                if ui.button("+0.01").clicked() {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_speed(self.snap.sub_speed + 0.01);
-                                                    }
-                                                }
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(format!(
+                                                                        "{:.2}x",
+                                                                        self.snap.sub_speed
+                                                                    ))
+                                                                    .size(12.0),
+                                                                )
+                                                                .fill(Color32::TRANSPARENT),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Some(m) = &mpv {
+                                                                m.set_sub_speed(1.0);
+                                                            }
+                                                        }
+                                                    },
+                                                );
                                             });
+                                            if let Some(sp) = hairline_bar(
+                                                ui,
+                                                "sub_speed_bar",
+                                                row_w,
+                                                self.snap.sub_speed,
+                                                0.90,
+                                                1.10,
+                                                Some(1.0),
+                                            ) {
+                                                let snapped = (sp * 100.0).round() / 100.0;
+                                                if let Some(m) = &mpv {
+                                                    m.set_sub_speed(snapped);
+                                                }
+                                            }
+
+                                            // Headless hairline seekbar for Subtitle Size
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     egui::RichText::new("Size")
                                                         .size(12.0)
-                                                        .color(Color32::from_gray(170)),
+                                                        .color(Color32::from_gray(150)),
                                                 );
-                                                let mut sc = self.snap.sub_scale as f32;
-                                                if ui
-                                                    .add(
-                                                        egui::Slider::new(&mut sc, 0.5..=2.0)
-                                                            .show_value(false),
-                                                    )
-                                                    .changed()
-                                                {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_scale(sc as f64);
-                                                    }
-                                                }
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{:.0}%",
+                                                                self.snap.sub_scale * 100.0
+                                                            ))
+                                                            .size(12.0),
+                                                        );
+                                                    },
+                                                );
                                             });
+                                            if let Some(sc) = hairline_bar(
+                                                ui,
+                                                "sub_size_bar",
+                                                row_w,
+                                                self.snap.sub_scale,
+                                                0.5,
+                                                2.0,
+                                                None,
+                                            ) {
+                                                if let Some(m) = &mpv {
+                                                    m.set_sub_scale(sc);
+                                                }
+                                            }
 
-                                            // Free online subtitle search (no API key!)
-                                            ui.add_space(6.0);
+                                            // Online subtitle search (free, zero API key)
+                                            ui.add_space(8.0);
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
                                                 ui.add(
                                                     egui::TextEdit::singleline(&mut self.sub_query)
-                                                        .hint_text("Search online")
+                                                        .hint_text("Search subtitles")
+                                                        .frame(false)
+                                                        .margin(Margin::symmetric(8, 5))
                                                         .desired_width(row_w - 94.0),
                                                 );
                                                 ui.add(
                                                     egui::TextEdit::singleline(&mut self.sub_lang)
+                                                        .frame(false)
+                                                        .margin(Margin::symmetric(6, 5))
                                                         .desired_width(36.0),
                                                 );
                                                 if ui
@@ -1603,7 +1949,7 @@ impl StreamdApp {
                                                 ui.label(
                                                     egui::RichText::new(&self.sub_msg)
                                                         .size(11.5)
-                                                        .color(Color32::from_gray(150)),
+                                                        .color(Color32::from_gray(145)),
                                                 );
                                             }
                                             for item in self.sub_results.clone() {
@@ -1638,20 +1984,21 @@ impl StreamdApp {
                                         OptTab::Speed => {
                                             for r in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
                                                 let active = (self.snap.speed - r).abs() < 0.02;
-                                                let label = if active {
-                                                    format!("●  {r}×")
-                                                } else {
-                                                    format!("{r}×")
-                                                };
                                                 if ui
                                                     .add_sized(
-                                                        Vec2::new(row_w, 26.0),
+                                                        Vec2::new(row_w, 28.0),
                                                         egui::Button::new(
-                                                            egui::RichText::new(label).size(12.5),
+                                                            egui::RichText::new(format!("{r}x"))
+                                                                .size(12.5)
+                                                                .color(if active {
+                                                                    Color32::WHITE
+                                                                } else {
+                                                                    Color32::from_gray(165)
+                                                                }),
                                                         )
                                                         .fill(if active {
                                                             Color32::from_rgba_unmultiplied(
-                                                                255, 255, 255, 20,
+                                                                255, 255, 255, 18,
                                                             )
                                                         } else {
                                                             Color32::TRANSPARENT
@@ -1662,7 +2009,7 @@ impl StreamdApp {
                                                     if let Some(m) = &mpv {
                                                         m.set_speed(r);
                                                     }
-                                                    self.flash(format!("{r}×"));
+                                                    self.flash(format!("{r}x"));
                                                 }
                                             }
                                         }
