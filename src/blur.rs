@@ -20,10 +20,9 @@ const FS_BLUR_SRC: &str = r#"#version 150 core
 in vec2 v_uv;
 out vec4 frag_color;
 uniform sampler2D u_tex;
-uniform vec2 u_dir; // (1/w, 0) or (0, 1/h)
+uniform vec2 u_dir;
 
 void main() {
-    // 9-tap Gaussian blur
     vec4 sum = texture(u_tex, v_uv) * 0.2270270270;
     sum += texture(u_tex, v_uv + u_dir * 1.3846153846) * 0.3162162162;
     sum += texture(u_tex, v_uv - u_dir * 1.3846153846) * 0.3162162162;
@@ -37,16 +36,16 @@ const FS_COMP_SRC: &str = r#"#version 150 core
 in vec2 v_uv;
 out vec4 frag_color;
 uniform sampler2D u_tex;
-uniform vec4 u_tint; // rgb + alpha tint over blurred video
+uniform vec4 u_tint;
 uniform float u_alpha;
-uniform int u_fade_right; // 1 = progressive horizontal fade out to right (for pause scrim)
+uniform int u_fade_right;
 
 void main() {
     vec3 blurred = texture(u_tex, v_uv).rgb;
     vec3 col = mix(blurred, u_tint.rgb, u_tint.a);
     float a = u_alpha;
     if (u_fade_right == 1) {
-        a *= smoothstep(1.0, 0.0, pow(v_uv.x, 1.3));
+        a *= smoothstep(1.0, 0.0, pow(v_uv.x, 1.25));
     }
     frag_color = vec4(col, a);
 }
@@ -56,6 +55,9 @@ struct BlurInner {
     vao: glow::VertexArray,
     prog_blur: glow::Program,
     prog_comp: glow::Program,
+    src_tex: glow::Texture,
+    src_w: i32,
+    src_h: i32,
     fbo_a: glow::Framebuffer,
     tex_a: glow::Texture,
     fbo_b: glow::Framebuffer,
@@ -85,6 +87,7 @@ impl GpuBlur {
         gl.shader_source(vsh, vs);
         gl.compile_shader(vsh);
         if !gl.get_shader_compile_status(vsh) {
+            eprintln!("[streamd] blur VS error: {}", gl.get_shader_info_log(vsh));
             gl.delete_shader(vsh);
             gl.delete_program(p);
             return None;
@@ -93,6 +96,7 @@ impl GpuBlur {
         gl.shader_source(fsh, fs);
         gl.compile_shader(fsh);
         if !gl.get_shader_compile_status(fsh) {
+            eprintln!("[streamd] blur FS error: {}", gl.get_shader_info_log(fsh));
             gl.delete_shader(vsh);
             gl.delete_shader(fsh);
             gl.delete_program(p);
@@ -104,17 +108,14 @@ impl GpuBlur {
         gl.delete_shader(vsh);
         gl.delete_shader(fsh);
         if !gl.get_program_link_status(p) {
+            eprintln!("[streamd] blur link error: {}", gl.get_program_info_log(p));
             gl.delete_program(p);
             return None;
         }
         Some(p)
     }
 
-    unsafe fn make_rt(
-        gl: &glow::Context,
-        w: i32,
-        h: i32,
-    ) -> Option<(glow::Framebuffer, glow::Texture)> {
+    unsafe fn make_tex(gl: &glow::Context, w: i32, h: i32) -> Option<glow::Texture> {
         let tex = gl.create_texture().ok()?;
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.tex_parameter_i32(
@@ -148,6 +149,15 @@ impl GpuBlur {
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(None),
         );
+        Some(tex)
+    }
+
+    unsafe fn make_rt(
+        gl: &glow::Context,
+        w: i32,
+        h: i32,
+    ) -> Option<(glow::Framebuffer, glow::Texture)> {
+        let tex = Self::make_tex(gl, w, h)?;
         let fbo = gl.create_framebuffer().ok()?;
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.framebuffer_texture_2d(
@@ -165,12 +175,16 @@ impl GpuBlur {
         let vao = gl.create_vertex_array().ok()?;
         let prog_blur = Self::compile(gl, VS_SRC, FS_BLUR_SRC)?;
         let prog_comp = Self::compile(gl, VS_SRC, FS_COMP_SRC)?;
+        let src_tex = Self::make_tex(gl, 64, 64)?;
         let (fbo_a, tex_a) = Self::make_rt(gl, 64, 64)?;
         let (fbo_b, tex_b) = Self::make_rt(gl, 64, 64)?;
         Some(BlurInner {
             vao,
             prog_blur,
             prog_comp,
+            src_tex,
+            src_w: 64,
+            src_h: 64,
             fbo_a,
             tex_a,
             fbo_b,
@@ -180,8 +194,8 @@ impl GpuBlur {
         })
     }
 
-    /// Blurs the live framebuffer region `(x, y_bottom, w, h)` in pixel coordinates and composites
-    /// frosted glass back onto `dst_fbo`.
+    /// Captures the live framebuffer region via `glCopyTexSubImage2D` (works across sRGB/default FBOs
+    /// on macOS, Windows, and Linux), applies 3-pass wide Gaussian blur, and composites frosted glass.
     pub fn draw_frosted_region(
         &self,
         gl: &glow::Context,
@@ -200,11 +214,36 @@ impl GpuBlur {
         let mut guard = self.inner.lock().unwrap();
         let Some(st) = guard.as_mut() else { return };
 
-        let bw = (w / 4).clamp(16, 512);
-        let bh = (h / 4).clamp(16, 512);
+        let bw = (w / 4).clamp(16, 480);
+        let bh = (h / 4).clamp(16, 480);
 
         unsafe {
-            // Resize downsampled ping-pong targets if needed
+            let was_scissor = gl.is_enabled(glow::SCISSOR_TEST);
+            let was_blend = gl.is_enabled(glow::BLEND);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.active_texture(glow::TEXTURE0);
+
+            // 1. Copy region from active framebuffer via glCopyTexSubImage2D (works with macOS sRGB FBO 0!)
+            gl.bind_framebuffer(glow::FRAMEBUFFER, dst_fbo);
+            gl.bind_texture(glow::TEXTURE_2D, Some(st.src_tex));
+            if st.src_w != w || st.src_h != h {
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    w,
+                    h,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                st.src_w = w;
+                st.src_h = h;
+            }
+            gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, x, y_bottom, w, h);
+
             if st.bw != bw || st.bh != bh {
                 for tex in [st.tex_a, st.tex_b] {
                     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
@@ -224,31 +263,7 @@ impl GpuBlur {
                 st.bh = bh;
             }
 
-            let was_scissor = gl.is_enabled(glow::SCISSOR_TEST);
-            let was_blend = gl.is_enabled(glow::BLEND);
-            gl.disable(glow::SCISSOR_TEST);
-
-            // 1. Downsample copy from current framebuffer region into fbo_a
-            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, dst_fbo);
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(st.fbo_a));
-            gl.blit_framebuffer(
-                x,
-                y_bottom,
-                x + w,
-                y_bottom + h,
-                0,
-                0,
-                bw,
-                bh,
-                glow::COLOR_BUFFER_BIT,
-                glow::LINEAR,
-            );
-
             gl.bind_vertex_array(Some(st.vao));
-            gl.active_texture(glow::TEXTURE0);
-            gl.disable(glow::BLEND);
-
-            // 2. Two iterations of separable H+V Gaussian blur for deep Apple-like frosted glass
             gl.use_program(Some(st.prog_blur));
             if let Some(loc) = gl.get_uniform_location(st.prog_blur, "u_tex") {
                 gl.uniform_1_i32(Some(&loc), 0);
@@ -256,9 +271,23 @@ impl GpuBlur {
             let dir_loc = gl.get_uniform_location(st.prog_blur, "u_dir");
             gl.viewport(0, 0, bw, bh);
 
-            for pass in 0..2 {
-                let spread = if pass == 0 { 1.4_f32 } else { 2.6_f32 };
-                // Horizontal: tex_a -> fbo_b
+            // Pass 0: downsample + horizontal blur from src_tex -> fbo_b, then vertical -> fbo_a
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_b));
+            gl.bind_texture(glow::TEXTURE_2D, Some(st.src_tex));
+            if let Some(loc) = &dir_loc {
+                gl.uniform_2_f32(Some(loc), 1.6_f32 / bw as f32, 0.0);
+            }
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_a));
+            gl.bind_texture(glow::TEXTURE_2D, Some(st.tex_b));
+            if let Some(loc) = &dir_loc {
+                gl.uniform_2_f32(Some(loc), 0.0, 1.6_f32 / bh as f32);
+            }
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+
+            // Passes 1 & 2: progressively wider separable Gaussian passes for rich Apple frosted glass
+            for spread in [3.2_f32, 5.5_f32] {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_b));
                 gl.bind_texture(glow::TEXTURE_2D, Some(st.tex_a));
                 if let Some(loc) = &dir_loc {
@@ -266,7 +295,6 @@ impl GpuBlur {
                 }
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
-                // Vertical: tex_b -> fbo_a
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_a));
                 gl.bind_texture(glow::TEXTURE_2D, Some(st.tex_b));
                 if let Some(loc) = &dir_loc {
@@ -275,7 +303,7 @@ impl GpuBlur {
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
 
-            // 3. Composite frosted blur back onto dst_fbo at (x, y_bottom, w, h)
+            // 3. Composite frosted glass back onto dst_fbo
             gl.bind_framebuffer(glow::FRAMEBUFFER, dst_fbo);
             gl.viewport(x, y_bottom, w, h);
             gl.enable(glow::BLEND);
@@ -303,7 +331,6 @@ impl GpuBlur {
             }
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
-            // Restore GL state cleanly for egui
             gl.use_program(None);
             gl.bind_vertex_array(None);
             if was_scissor {

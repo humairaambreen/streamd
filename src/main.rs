@@ -749,6 +749,7 @@ struct StreamdApp {
     scroll_accum: f32,
     last_scroll_step: Instant,
     expand_t: f32,
+    morph_start: Instant,
     closing_morph: bool,
     morph_tex: Option<TextureHandle>,
     poster_requested_for: Option<String>,
@@ -871,6 +872,7 @@ impl StreamdApp {
             scroll_accum: 0.0,
             last_scroll_step: Instant::now() - Duration::from_secs(1),
             expand_t: 0.0,
+            morph_start: Instant::now() - Duration::from_secs(1),
             closing_morph: false,
             morph_tex: None,
             poster_requested_for: None,
@@ -1031,31 +1033,33 @@ impl StreamdApp {
         });
     }
 
-    fn capture_mpv_frame(&self, ctx: &egui::Context, tag: &str) -> Option<TextureHandle> {
-        let mpv = self.mpv.as_ref()?;
-        let tmp = std::env::temp_dir().join(format!(
-            "streamd_cap_{}_{:x}.jpg",
-            tag,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        mpv.screenshot_to_file(&tmp.to_string_lossy());
-        let bytes = std::fs::read(&tmp).ok();
-        let _ = std::fs::remove_file(&tmp);
-        let bytes = bytes?;
-        let img = image::load_from_memory(&bytes).ok()?;
-        let rgba = img.to_rgba8();
-        let ci = ColorImage::from_rgba_unmultiplied(
-            [rgba.width() as usize, rgba.height() as usize],
-            rgba.as_raw(),
-        );
-        Some(ctx.load_texture(
-            format!("cap_{tag}_{}", bytes.len()),
-            ci,
-            TextureOptions::LINEAR,
-        ))
+    fn capture_mpv_frame_async(&self, src_key: String, ctx: &egui::Context) {
+        let Some(mpv) = self.mpv.clone() else { return };
+        let tx = self.card_thumb_tx.clone();
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let tmp = std::env::temp_dir().join(format!(
+                "streamd_cap_{:x}.jpg",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            mpv.screenshot_to_file(&tmp.to_string_lossy());
+            let bytes = std::fs::read(&tmp).ok();
+            let _ = std::fs::remove_file(&tmp);
+            if let Some(bytes) = bytes {
+                if let Ok(img) = image::load_from_memory(&bytes) {
+                    let rgba = img.to_rgba8();
+                    let ci = ColorImage::from_rgba_unmultiplied(
+                        [rgba.width() as usize, rgba.height() as usize],
+                        rgba.as_raw(),
+                    );
+                    let _ = tx.send((src_key, false, ci));
+                    egui_ctx.request_repaint();
+                }
+            }
+        });
     }
 
     fn activate_session(&mut self, meta: SessionMeta) {
@@ -1067,6 +1071,7 @@ impl StreamdApp {
         self.sub_msg.clear();
         self.closing_morph = false;
         self.expand_t = 0.0;
+        self.morph_start = Instant::now();
         self.poster_requested_for = None;
 
         let source = if meta.is_local {
@@ -1109,8 +1114,7 @@ impl StreamdApp {
         if self.closing_morph {
             return;
         }
-        // Instantly capture the EXACT currently-displayed frame from mpv in ~10ms (works on remote & local!)
-        let exact_frame = self.capture_mpv_frame(ctx, "resume");
+        // Non-blocking: kick off async exact-frame screenshot on background thread so UI has 0ms stall!
         if let Some(s) = self.session.clone() {
             let src = if s.is_local {
                 s.media_url.clone()
@@ -1127,18 +1131,17 @@ impl StreamdApp {
                     item.position = self.snap.position;
                     item.duration = self.snap.duration;
                 }
-                if let Some(tex) = exact_frame.clone() {
-                    item.resume_thumb = Some(tex.clone());
-                    if item.poster_thumb.is_none() {
-                        item.poster_thumb = Some(tex);
-                    }
-                }
+                self.morph_tex = item
+                    .resume_thumb
+                    .clone()
+                    .or_else(|| item.poster_thumb.clone());
             }
+            self.capture_mpv_frame_async(src, ctx);
         }
-        self.morph_tex = exact_frame;
         self.opts_open = false;
         self.studio_tab = None;
         self.closing_morph = true;
+        self.morph_start = Instant::now();
     }
 
     fn close_session(&mut self) {
@@ -1940,13 +1943,17 @@ impl StreamdApp {
             }
         }
 
-        // Smooth Card <-> Fullscreen morph animation
-        let exp_target = if self.closing_morph { 0.0 } else { 1.0 };
-        self.expand_t += (exp_target - self.expand_t) * (dt * 11.0).min(1.0);
-        if (self.expand_t - exp_target).abs() > 0.003 {
+        // Deterministic 280ms time-based Card <-> Fullscreen morph (zero stutter!)
+        let morph_p = (self.morph_start.elapsed().as_secs_f32() / 0.28).clamp(0.0, 1.0);
+        self.expand_t = if self.closing_morph {
+            1.0 - expo_out(morph_p)
+        } else {
+            expo_out(morph_p)
+        };
+        if morph_p < 1.0 {
             ctx.request_repaint();
         }
-        if self.closing_morph && self.expand_t <= 0.04 {
+        if self.closing_morph && morph_p >= 1.0 {
             self.close_session();
             return;
         }
@@ -2058,21 +2065,74 @@ impl StreamdApp {
 
         let mut want_fs_toggle = false;
 
-        let exp = expo_out(self.expand_t);
+        let exp = self.expand_t;
         let bg_v = (14.0 * (1.0 - exp)) as u8;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(bg_v, bg_v, bg_v)))
             .show(ctx, |ui| {
                 let full_rect = ui.max_rect();
 
-                // Aspect-locked Card <-> Fullscreen morph (zero stretching or squeezing!)
+                // Aspect-locked Card <-> Fullscreen morph + receding/returning Cover Flow side cards!
                 let scale = (full_rect.width() / 960.0).clamp(0.85, 1.35);
                 let card_w = 400.0 * scale;
                 let card_h = card_w * 9.0 / 16.0;
-                let card_box = Rect::from_center_size(
-                    Pos2::new(full_rect.center().x, full_rect.center().y - 34.0),
-                    Vec2::new(card_w, card_h),
-                );
+                let cx = full_rect.center().x;
+                let cy = full_rect.center().y - 34.0;
+                let card_box = Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(card_w, card_h));
+
+                // Draw receding/returning Cover Flow side peek cards smoothly behind the morphing card!
+                let side_vis = (1.0 - exp).clamp(0.0, 1.0);
+                if side_vis > 0.01 {
+                    let total_cards = 1 + self.library.len();
+                    for idx in 0..total_cards {
+                        if idx == self.carousel_target {
+                            continue;
+                        }
+                        let d = idx as f32 - self.carousel_pos;
+                        if d.abs() > 2.2 {
+                            continue;
+                        }
+                        let ad = d.abs();
+                        let sw = (if ad <= 1.0 { 288.0 } else { 220.0 })
+                            * scale
+                            * (0.86 + 0.14 * side_vis);
+                        let sh = sw * 9.0 / 16.0;
+                        let sign = if d >= 0.0 { 1.0 } else { -1.0 };
+                        let x_off = sign
+                            * (if ad <= 1.0 { 300.0 } else { 490.0 })
+                            * scale
+                            * (1.0 + 0.15 * exp);
+                        let sr =
+                            Rect::from_center_size(Pos2::new(cx + x_off, cy), Vec2::new(sw, sh));
+                        let a = (side_vis * (1.0 - (ad * 0.4).min(0.75)) * 255.0) as u8;
+                        if idx == 0 {
+                            ui.painter().rect_filled(
+                                sr,
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(232, 232, 227, a),
+                            );
+                        } else {
+                            let item = &self.library[idx - 1];
+                            if let Some(tex) =
+                                item.poster_thumb.as_ref().or(item.resume_thumb.as_ref())
+                            {
+                                ui.painter().image(
+                                    tex.id(),
+                                    sr,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, a),
+                                );
+                            } else {
+                                ui.painter().rect_filled(
+                                    sr,
+                                    CornerRadius::ZERO,
+                                    Color32::from_rgba_unmultiplied(37, 37, 40, a),
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let aspect = if let Some(tex) = &self.morph_tex {
                     tex.aspect_ratio()
                 } else if self.snap.width > 0 && self.snap.height > 0 {
@@ -2094,7 +2154,7 @@ impl StreamdApp {
                 );
 
                 // 1. Live GPU mpv when expanded, or aspect-locked centered morph frame during transition
-                if !self.closing_morph && exp >= 0.96 {
+                if !self.closing_morph && exp >= 0.99 {
                     if let Some(mpv) = self.mpv.clone() {
                         let cb = egui_glow::CallbackFn::new(move |info, painter| {
                             let vp = info.viewport_in_pixels();
@@ -3755,6 +3815,12 @@ impl eframe::App for StreamdApp {
                     item.poster_thumb = Some(tex.clone());
                 } else {
                     item.resume_thumb = Some(tex.clone());
+                    if item.poster_thumb.is_none() {
+                        item.poster_thumb = Some(tex.clone());
+                    }
+                    if self.closing_morph {
+                        self.morph_tex = Some(tex);
+                    }
                 }
             }
         }
