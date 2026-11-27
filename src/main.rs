@@ -1,5 +1,8 @@
+mod blur;
 mod engine;
 mod mpv;
+
+use blur::GpuBlur;
 
 use eframe::{
     egui::{
@@ -223,6 +226,65 @@ fn sibling_videos(path: &Path) -> (Vec<PathBuf>, usize) {
         (vec![path.to_path_buf()], 0)
     } else {
         (list, idx)
+    }
+}
+
+fn fit_aspect_rect(container: Rect, aspect: f32) -> Rect {
+    let a = if aspect.is_finite() && aspect > 0.1 {
+        aspect
+    } else {
+        16.0 / 9.0
+    };
+    let cw = container.width().max(1.0);
+    let ch = container.height().max(1.0);
+    let (w, h) = if cw / ch > a {
+        (ch * a, ch)
+    } else {
+        (cw, cw / a)
+    };
+    Rect::from_center_size(container.center(), Vec2::new(w, h))
+}
+
+fn paint_frosted(
+    painter: &egui::Painter,
+    blur: &Option<Arc<GpuBlur>>,
+    rect: Rect,
+    tint: [f32; 4],
+    alpha: f32,
+    fade_right: bool,
+) {
+    if let Some(b) = blur.clone() {
+        let cb = egui_glow::CallbackFn::new(move |info, gl_painter| {
+            let vp = info.viewport_in_pixels();
+            b.draw_frosted_region(
+                gl_painter.gl(),
+                gl_painter.intermediate_fbo(),
+                vp.left_px,
+                vp.from_bottom_px,
+                vp.width_px,
+                vp.height_px,
+                tint,
+                alpha,
+                fade_right,
+            );
+        });
+        painter.add(PaintCallback {
+            rect,
+            callback: Arc::new(cb),
+        });
+    } else if fade_right {
+        paint_fade_h(
+            painter,
+            rect,
+            Color32::from_rgba_unmultiplied(0, 0, 0, (195.0 * alpha) as u8),
+            Color32::TRANSPARENT,
+        );
+    } else {
+        painter.rect_filled(
+            rect,
+            CornerRadius::ZERO,
+            Color32::from_rgba_unmultiplied(12, 12, 14, (232.0 * alpha) as u8),
+        );
     }
 }
 
@@ -668,6 +730,7 @@ struct StreamdApp {
     engine: Arc<Engine>,
     mpv: Option<Arc<MpvPlayer>>,
     mpv_err: Option<String>,
+    blur: Option<Arc<GpuBlur>>,
 
     // Home Cover-Flow stage & inputs
     url: String,
@@ -783,6 +846,7 @@ impl StreamdApp {
             None => (None, Some("OpenGL proc address loader unavailable".into())),
         };
 
+        let blur = cc.gl.as_ref().map(|gl| Arc::new(GpuBlur::new(gl)));
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (card_thumb_tx, card_thumb_rx) = mpsc::channel();
 
@@ -790,6 +854,7 @@ impl StreamdApp {
             engine,
             mpv,
             mpv_err,
+            blur,
             url: String::new(),
             show_hdrs: false,
             hdrs_anim: 0.0,
@@ -1379,7 +1444,7 @@ impl StreamdApp {
                     db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                // 1. Floor reflections (smoothly fade out when headers drawer expands so zero overlap!)
+                // 1. Real mirrored floor reflections beneath each visible card
                 let refl_vis = 1.0 - expo_out(self.hdrs_anim);
                 if refl_vis > 0.02 {
                     for &idx in &order {
@@ -1388,24 +1453,64 @@ impl StreamdApp {
                             continue;
                         }
                         let (cr, dim) = card_geom(d);
-                        let ref_h = (cr.height() * 0.36).min(82.0 * scale);
+                        let is_center = idx == self.carousel_target && d.abs() < 0.15;
+                        let ref_h = (cr.height() * 0.36).min(84.0 * scale);
                         let rr = Rect::from_min_size(
-                            Pos2::new(cr.left(), cr.bottom() + 3.0),
+                            Pos2::new(cr.left(), cr.bottom() + 2.0),
                             Vec2::new(cr.width(), ref_h),
                         );
-                        let base_col = if idx == 0 { CARD_PAPER } else { CARD_DARK };
-                        let top_a = ((1.0 - dim) * 85.0 * refl_vis) as u8;
-                        paint_fade_v(
-                            ui.painter(),
-                            rr,
-                            Color32::from_rgba_unmultiplied(
-                                base_col.r(),
-                                base_col.g(),
-                                base_col.b(),
-                                top_a,
-                            ),
-                            Color32::TRANSPARENT,
-                        );
+
+                        if idx == 0 {
+                            let top_a = ((1.0 - dim) * 65.0 * refl_vis) as u8;
+                            paint_fade_v(
+                                ui.painter(),
+                                rr,
+                                Color32::from_rgba_unmultiplied(
+                                    CARD_PAPER.r(),
+                                    CARD_PAPER.g(),
+                                    CARD_PAPER.b(),
+                                    top_a,
+                                ),
+                                Color32::TRANSPARENT,
+                            );
+                        } else {
+                            let item = &self.library[idx - 1];
+                            let tex_opt = if is_center {
+                                item.resume_thumb.as_ref().or(item.poster_thumb.as_ref())
+                            } else {
+                                item.poster_thumb.as_ref().or(item.resume_thumb.as_ref())
+                            };
+                            if let Some(tex) = tex_opt {
+                                // Vertically flipped bottom slice of actual video frame!
+                                let tint_a = ((1.0 - dim) * 145.0 * refl_vis) as u8;
+                                ui.painter().image(
+                                    tex.id(),
+                                    rr,
+                                    Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.62)),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, tint_a),
+                                );
+                                // Smoothly dissolve mirrored reflection into #0E0E0F floor
+                                paint_fade_v(
+                                    ui.painter(),
+                                    rr,
+                                    Color32::from_rgba_unmultiplied(14, 14, 15, 110),
+                                    BG,
+                                );
+                            } else {
+                                let top_a = ((1.0 - dim) * 55.0 * refl_vis) as u8;
+                                paint_fade_v(
+                                    ui.painter(),
+                                    rr,
+                                    Color32::from_rgba_unmultiplied(
+                                        CARD_DARK.r(),
+                                        CARD_DARK.g(),
+                                        CARD_DARK.b(),
+                                        top_a,
+                                    ),
+                                    Color32::TRANSPARENT,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -1953,34 +2058,42 @@ impl StreamdApp {
 
         let mut want_fs_toggle = false;
 
+        let exp = expo_out(self.expand_t);
+        let bg_v = (14.0 * (1.0 - exp)) as u8;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(14, 14, 15)))
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(bg_v, bg_v, bg_v)))
             .show(ctx, |ui| {
                 let full_rect = ui.max_rect();
-                let exp = expo_out(self.expand_t);
 
-                // Compute smooth morphed rect from centered 400x225 Cover-Flow card -> full window!
+                // Aspect-locked Card <-> Fullscreen morph (zero stretching or squeezing!)
                 let scale = (full_rect.width() / 960.0).clamp(0.85, 1.35);
                 let card_w = 400.0 * scale;
                 let card_h = card_w * 9.0 / 16.0;
-                let start_rect = Rect::from_center_size(
+                let card_box = Rect::from_center_size(
                     Pos2::new(full_rect.center().x, full_rect.center().y - 34.0),
                     Vec2::new(card_w, card_h),
                 );
+                let aspect = if let Some(tex) = &self.morph_tex {
+                    tex.aspect_ratio()
+                } else if self.snap.width > 0 && self.snap.height > 0 {
+                    self.snap.width as f32 / self.snap.height as f32
+                } else {
+                    16.0 / 9.0
+                };
+                let start_rect = fit_aspect_rect(card_box, aspect);
+                let end_rect = fit_aspect_rect(full_rect, aspect);
                 let video_rect = Rect::from_min_max(
                     Pos2::new(
-                        start_rect.left() + (full_rect.left() - start_rect.left()) * exp,
-                        start_rect.top() + (full_rect.top() - start_rect.top()) * exp,
+                        start_rect.left() + (end_rect.left() - start_rect.left()) * exp,
+                        start_rect.top() + (end_rect.top() - start_rect.top()) * exp,
                     ),
                     Pos2::new(
-                        start_rect.right() + (full_rect.right() - start_rect.right()) * exp,
-                        start_rect.bottom() + (full_rect.bottom() - start_rect.bottom()) * exp,
+                        start_rect.right() + (end_rect.right() - start_rect.right()) * exp,
+                        start_rect.bottom() + (end_rect.bottom() - start_rect.bottom()) * exp,
                     ),
                 );
 
-                // 1. Centered Card <-> Fullscreen morph:
-                // During morph (expand_t < 0.96 or closing), draw the centered crisp HD frame so OpenGL
-                // mpv never snaps to the bottom-left (0,0) origin; at full size render live mpv GPU!
+                // 1. Live GPU mpv when expanded, or aspect-locked centered morph frame during transition
                 if !self.closing_morph && exp >= 0.96 {
                     if let Some(mpv) = self.mpv.clone() {
                         let cb = egui_glow::CallbackFn::new(move |info, painter| {
@@ -2000,7 +2113,7 @@ impl StreamdApp {
                     ui.painter().rect_filled(
                         video_rect,
                         CornerRadius::ZERO,
-                        Color32::from_rgb(24, 24, 26),
+                        Color32::from_rgb(18, 18, 20),
                     );
                     if let Some(tex) = &self.morph_tex {
                         ui.painter().image(
@@ -2036,19 +2149,14 @@ impl StreamdApp {
 
                 let p = ui.painter();
 
-                // 2. Smooth vertex-interpolated Pause Overlay
+                // 2. Real GPU Progressive Frosted Blur Pause Overlay
                 let pe = expo_out(self.pause_t);
                 if pe > 0.01 {
                     let scrim = Rect::from_min_size(
                         full_rect.min,
-                        Vec2::new(full_rect.width() * 0.65, full_rect.height()),
+                        Vec2::new(full_rect.width() * 0.62, full_rect.height()),
                     );
-                    paint_fade_h(
-                        p,
-                        scrim,
-                        Color32::from_rgba_unmultiplied(0, 0, 0, (195.0 * pe) as u8),
-                        Color32::TRANSPARENT,
-                    );
+                    paint_frosted(p, &self.blur, scrim, [0.03, 0.03, 0.04, 0.52], pe, true);
 
                     let lx = full_rect.left() + (full_rect.width() * 0.07).max(40.0);
                     let cy = full_rect.center().y - 20.0 + (1.0 - pe) * 12.0;
@@ -2457,10 +2565,13 @@ impl StreamdApp {
                     let oy = full_rect.bottom() - 68.0 - oh + (1.0 - oe) * 10.0;
                     let orect = Rect::from_min_size(Pos2::new(ox, oy), Vec2::new(ow, oh));
 
-                    ui.painter().rect_filled(
+                    paint_frosted(
+                        ui.painter(),
+                        &self.blur,
                         orect,
-                        CornerRadius::ZERO,
-                        Color32::from_rgba_unmultiplied(12, 12, 14, (238.0 * oe) as u8),
+                        [0.05, 0.05, 0.06, 0.62],
+                        oe,
+                        false,
                     );
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(orect), |ui| {
@@ -2863,10 +2974,13 @@ impl StreamdApp {
                         Color32::TRANSPARENT,
                         Color32::from_rgba_unmultiplied(0, 0, 0, (140.0 * se) as u8),
                     );
-                    ui.painter().rect_filled(
+                    paint_frosted(
+                        ui.painter(),
+                        &self.blur,
                         srect,
-                        CornerRadius::ZERO,
-                        Color32::from_rgba_unmultiplied(8, 8, 10, (242.0 * se) as u8),
+                        [0.04, 0.04, 0.05, 0.66],
+                        se,
+                        false,
                     );
 
                     let active_studio = self.studio_tab.unwrap_or(self.opt_tab);
