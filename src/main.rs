@@ -771,6 +771,7 @@ struct StreamdApp {
     home_entered_at: Instant,
     player_open: bool,
     closing_morph: bool,
+    pending_close_since: Option<Instant>,
     morph_tex: Option<TextureHandle>,
     poster_requested_for: Option<String>,
     pending_resume_pos: Option<f64>,
@@ -897,6 +898,7 @@ impl StreamdApp {
             home_entered_at: Instant::now() - Duration::from_secs(2),
             player_open: false,
             closing_morph: false,
+            pending_close_since: None,
             morph_tex: None,
             poster_requested_for: None,
             pending_resume_pos: None,
@@ -1179,10 +1181,11 @@ impl StreamdApp {
     }
 
     fn begin_close_morph(&mut self, ctx: &egui::Context) {
-        if self.closing_morph {
+        if self.closing_morph || self.pending_close_since.is_some() {
             return;
         }
-        // Pause immediately and read exact millisecond position so saved timestamp never drifts
+        // Pause immediately and read exact millisecond position; keep the live paused frame on screen
+        // for ~20-40ms while the exact frame texture finishes capturing so the poster thumbnail NEVER flashes!
         let exact_pos = if let Some(mpv) = &self.mpv {
             mpv.set_paused(true);
             mpv.exact_position()
@@ -1212,14 +1215,15 @@ impl StreamdApp {
         }
         self.opts_open = false;
         self.studio_tab = None;
-        self.closing_morph = true;
-        self.morph_start = Instant::now();
+        self.pending_close_since = Some(Instant::now());
+        ctx.request_repaint();
     }
 
     fn finish_close_to_home(&mut self) {
         // Keep session & .part alive in background while browsing Cover Flow (wiped on new video or exit)
         self.player_open = false;
         self.closing_morph = false;
+        self.pending_close_since = None;
         self.expand_t = 0.0;
         self.home_entered_at = Instant::now();
         self.opts_open = false;
@@ -2105,6 +2109,17 @@ impl StreamdApp {
             }
         }
 
+        // Safety fallback: if screenshot takes > 250ms, start closing morph anyway so UI never hangs
+        if let Some(since) = self.pending_close_since {
+            if since.elapsed() >= Duration::from_millis(250) {
+                self.pending_close_since = None;
+                self.closing_morph = true;
+                self.morph_start = Instant::now();
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
         // Lush 520ms cubic ease-in-out Card <-> Fullscreen morph (clearly readable Apple TV feel!)
         let morph_p = (self.morph_start.elapsed().as_secs_f32() / 0.52).clamp(0.0, 1.0);
         self.expand_t = if self.closing_morph {
@@ -2572,8 +2587,9 @@ impl StreamdApp {
                     }
                 }
 
-                // Skip all player chrome, pause blur, HUD, and overlays until mpv is actually ready!
-                if !mpv_ready {
+                // Skip all player chrome, pause blur, HUD, and overlays until mpv is actually ready
+                // (also hide chrome while waiting ~20ms for exact close-frame capture!)
+                if !mpv_ready || self.pending_close_since.is_some() {
                     return;
                 }
 
@@ -4250,8 +4266,12 @@ impl eframe::App for StreamdApp {
                     if item.poster_thumb.is_none() {
                         item.poster_thumb = Some(tex.clone());
                     }
-                    if self.closing_morph {
+                    if self.pending_close_since.is_some() || self.closing_morph {
                         self.morph_tex = Some(tex);
+                        if self.pending_close_since.take().is_some() {
+                            self.closing_morph = true;
+                            self.morph_start = Instant::now();
+                        }
                     }
                 }
             }
