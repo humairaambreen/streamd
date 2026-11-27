@@ -469,13 +469,21 @@ impl MpvPlayer {
     }
 
     pub fn load_url_at(&self, url: &str, start_sec: Option<f64>) {
-        if let Some(sec) = start_sec.filter(|&s| s > 0.5) {
-            self.set_string("start", &format!("{sec:.2}"));
-        } else {
-            self.set_string("start", "none");
+        let start_val = match start_sec.filter(|&s| s > 0.5) {
+            Some(sec) => format!("{sec:.2}"),
+            None => "none".into(),
+        };
+        let ck = CString::new("start").unwrap();
+        let cv = CString::new(start_val).unwrap();
+        unsafe {
+            (self.api.set_option_string)(self.handle, ck.as_ptr(), cv.as_ptr());
         }
         self.set_flag("pause", false);
         self.cmd_async(&["loadfile", url, "replace"]);
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.set_flag("pause", paused);
     }
 
     pub fn stop(&self) {

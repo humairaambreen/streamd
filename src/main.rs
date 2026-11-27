@@ -1110,8 +1110,8 @@ impl StreamdApp {
         }
 
         if let Some(mpv) = &self.mpv {
-            let start_pos = self.pending_resume_pos.take();
-            mpv.load_url_at(&meta.media_url, start_pos);
+            // Pass start position directly to mpv AND keep pending_resume_pos as fallback guard for HTTP streams
+            mpv.load_url_at(&meta.media_url, self.pending_resume_pos);
         }
         self.session = Some(meta);
         self.last_mouse_move = Instant::now();
@@ -1120,6 +1120,10 @@ impl StreamdApp {
     fn begin_close_morph(&mut self, ctx: &egui::Context) {
         if self.closing_morph {
             return;
+        }
+        // Pause immediately so audio stops on frame 0 of closing
+        if let Some(mpv) = &self.mpv {
+            mpv.set_paused(true);
         }
         // Non-blocking: kick off async exact-frame screenshot on background thread so UI has 0ms stall!
         if let Some(s) = self.session.clone() {
@@ -1409,7 +1413,6 @@ impl StreamdApp {
 
         const BG: Color32 = Color32::from_rgb(14, 14, 15); // #0E0E0F
         const CARD_DARK: Color32 = Color32::from_rgb(37, 37, 40); // #252528
-        const CARD_EDGE: Color32 = Color32::from_rgb(58, 58, 61); // #3A3A3D
         const CARD_PAPER: Color32 = Color32::from_rgb(232, 232, 227); // #E8E8E3
         const ACCENT_BLUE: Color32 = Color32::from_rgb(77, 148, 255); // #4D94FF
         const TEXT_MAIN: Color32 = Color32::from_rgb(232, 232, 227);
@@ -1963,7 +1966,9 @@ impl StreamdApp {
             }
             if let Some(pos) = self.pending_resume_pos {
                 if self.snap.duration > 0.0 {
-                    mpv.seek_absolute(pos);
+                    if (self.snap.position - pos).abs() > 2.5 {
+                        mpv.seek_absolute(pos);
+                    }
                     self.pending_resume_pos = None;
                 }
             }
@@ -2255,6 +2260,12 @@ impl StreamdApp {
                     } else if let Some(mpv) = &self.mpv {
                         mpv.toggle_pause();
                     }
+                }
+
+                // Skip all player chrome, pause blur, HUD, and overlays during open/close morph so
+                // nothing flashes or bleeds across the shrinking/expanding card!
+                if self.closing_morph || exp < 0.96 {
+                    return;
                 }
 
                 let p = ui.painter();
