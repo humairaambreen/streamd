@@ -107,9 +107,29 @@ fn fmt_time(sec: f64) -> String {
     }
 }
 
+fn fmt_time_precise(sec: f64, duration: f64) -> String {
+    if !sec.is_finite() || sec < 0.0 {
+        return if duration > 0.0 && duration < 60.0 {
+            "0:00.0".into()
+        } else {
+            "0:00".into()
+        };
+    }
+    if duration > 0.0 && duration < 60.0 {
+        let m = (sec / 60.0).floor() as u64;
+        let rem = sec - (m as f64 * 60.0);
+        format!("{m}:{rem:04.1}")
+    } else {
+        fmt_time(sec)
+    }
+}
+
 fn fmt_remaining(sec: f64) -> String {
-    if !sec.is_finite() || sec <= 0.0 {
+    if !sec.is_finite() || sec <= 0.05 {
         return String::new();
+    }
+    if sec < 60.0 {
+        return format!("{sec:.1}s left");
     }
     let mins = (sec / 60.0).ceil() as u64;
     let h = mins / 60;
@@ -1130,6 +1150,14 @@ impl StreamdApp {
         if let Some(mpv) = &self.mpv {
             if start_over {
                 mpv.seek_absolute(0.0);
+                self.snap.position = 0.0;
+                if let Some(item) = self
+                    .library
+                    .iter_mut()
+                    .find(|x| x.source == self.session_source)
+                {
+                    item.position = 0.0;
+                }
             }
             mpv.set_paused(false);
         }
@@ -1154,10 +1182,14 @@ impl StreamdApp {
         if self.closing_morph {
             return;
         }
-        // Pause immediately (keep session warm in background so re-clicking resumes in 0ms!)
-        if let Some(mpv) = &self.mpv {
+        // Pause immediately and read exact millisecond position so saved timestamp never drifts
+        let exact_pos = if let Some(mpv) = &self.mpv {
             mpv.set_paused(true);
-        }
+            mpv.exact_position()
+        } else {
+            self.snap.position
+        };
+        self.snap.position = exact_pos;
         if let Some(s) = self.session.clone() {
             let src = self.session_source.clone();
             if let Some(item) = self.library.iter_mut().find(|x| x.source == src) {
@@ -1167,7 +1199,7 @@ impl StreamdApp {
                     item.name = self.title.clone();
                 }
                 if self.snap.duration > 0.0 {
-                    item.position = self.snap.position;
+                    item.position = exact_pos.min(self.snap.duration);
                     item.duration = self.snap.duration;
                 }
                 self.morph_tex = item
@@ -1869,7 +1901,11 @@ impl StreamdApp {
 
                         let fs = (13.5 * (cr.width() / (400.0 * scale))).clamp(10.5, 14.5);
                         let status_str = if item.duration > 0.0 {
-                            format!("{} / {}", fmt_time(item.position), fmt_time(item.duration))
+                            format!(
+                                "{} / {}",
+                                fmt_time_precise(item.position, item.duration),
+                                fmt_time_precise(item.duration, item.duration)
+                            )
                         } else {
                             "NEW".into()
                         };
@@ -1908,25 +1944,31 @@ impl StreamdApp {
                             );
                         }
 
-                        // Text-only "Start Over" (NO box!) softly fading in after closing morph finishes
+                        // Register card interaction FIRST, then "Start Over" on top so Start Over receives
+                        // hover & clicks cleanly without the card stealing them!
+                        let card_resp =
+                            ui.interact(cr, egui::Id::new(("cf_card", idx)), Sense::click());
+
                         let mut clicked_start_over = false;
-                        if is_center && item.position > 3.0 && start_over_fade > 0.02 {
+                        if is_center && item.position > 0.5 && start_over_fade > 0.02 {
                             let so_r = Rect::from_min_size(
-                                Pos2::new(cr.right() - 84.0, cr.top() + 10.0),
-                                Vec2::new(72.0, 24.0),
+                                Pos2::new(cr.right() - 88.0, cr.top() + 10.0),
+                                Vec2::new(76.0, 26.0),
                             );
-                            let so_resp = ui.interact(
-                                so_r,
-                                egui::Id::new(("cf_start_over", idx)),
-                                Sense::click(),
-                            );
-                            let txt_a = ((if so_resp.hovered() { 255.0 } else { 195.0 })
+                            let so_resp = ui
+                                .interact(
+                                    so_r,
+                                    egui::Id::new(("cf_start_over", idx)),
+                                    Sense::click(),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let txt_a = ((if so_resp.hovered() { 255.0 } else { 150.0 })
                                 * start_over_fade) as u8;
                             ui.painter().text(
                                 so_r.center() + Vec2::new(0.0, 1.0),
                                 Align2::CENTER_CENTER,
                                 "Start Over",
-                                FontId::proportional(12.5),
+                                FontId::proportional(13.0),
                                 Color32::from_rgba_unmultiplied(
                                     0,
                                     0,
@@ -1938,7 +1980,7 @@ impl StreamdApp {
                                 so_r.center(),
                                 Align2::CENTER_CENTER,
                                 "Start Over",
-                                FontId::proportional(12.5),
+                                FontId::proportional(13.0),
                                 Color32::from_rgba_unmultiplied(255, 255, 255, txt_a),
                             );
                             if so_resp.clicked() {
@@ -1947,15 +1989,11 @@ impl StreamdApp {
                             }
                         }
 
-                        if !clicked_start_over {
-                            let resp =
-                                ui.interact(cr, egui::Id::new(("cf_card", idx)), Sense::click());
-                            if resp.clicked() {
-                                if is_center {
-                                    open_card_idx = Some((idx - 1, false));
-                                } else {
-                                    self.carousel_target = idx;
-                                }
+                        if !clicked_start_over && card_resp.clicked() {
+                            if is_center {
+                                open_card_idx = Some((idx - 1, false));
+                            } else {
+                                self.carousel_target = idx;
                             }
                         }
                     }
@@ -2035,7 +2073,7 @@ impl StreamdApp {
             }
             if let Some(pos) = self.pending_resume_pos {
                 if self.snap.duration > 0.0 {
-                    if (self.snap.position - pos).abs() > 2.5 {
+                    if (self.snap.position - pos).abs() > 0.25 {
                         mpv.seek_absolute(pos);
                     }
                     self.pending_resume_pos = None;
@@ -2498,8 +2536,8 @@ impl StreamdApp {
                                 Align2::RIGHT_CENTER,
                                 format!(
                                     "{} / {}",
-                                    fmt_time(self.snap.position),
-                                    fmt_time(self.snap.duration)
+                                    fmt_time_precise(self.snap.position, self.snap.duration),
+                                    fmt_time_precise(self.snap.duration, self.snap.duration)
                                 ),
                                 FontId::proportional(fs - 1.0),
                                 Color32::from_rgba_unmultiplied(
@@ -2594,11 +2632,18 @@ impl StreamdApp {
                             Color32::from_rgba_unmultiplied(255, 255, 255, a_dim),
                         );
                     }
+                    // Constrain pause title width cleanly so long/UUID filenames never cut across the video
+                    let display_title: String = if self.title.chars().count() > 28 {
+                        format!("{}…", self.title.chars().take(27).collect::<String>())
+                    } else {
+                        self.title.clone()
+                    };
+                    let title_size = if display_title.len() > 20 { 30.0 } else { 40.0 };
                     p.text(
                         Pos2::new(lx, cy + 12.0),
                         Align2::LEFT_CENTER,
-                        &self.title,
-                        FontId::proportional(40.0),
+                        display_title,
+                        FontId::proportional(title_size),
                         Color32::from_rgba_unmultiplied(255, 255, 255, a_hi),
                     );
                     if self.snap.duration > 0.0 {
@@ -2959,8 +3004,8 @@ impl StreamdApp {
                             ui.label(
                                 egui::RichText::new(format!(
                                     "{} / {}",
-                                    fmt_time(self.snap.position),
-                                    fmt_time(self.snap.duration)
+                                    fmt_time_precise(self.snap.position, self.snap.duration),
+                                    fmt_time_precise(self.snap.duration, self.snap.duration)
                                 ))
                                 .size(12.5)
                                 .color(Color32::from_rgba_unmultiplied(255, 255, 255, 195)),

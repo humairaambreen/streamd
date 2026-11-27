@@ -469,8 +469,8 @@ impl MpvPlayer {
     }
 
     pub fn load_url_at(&self, url: &str, start_sec: Option<f64>) {
-        let start_val = match start_sec.filter(|&s| s > 0.5) {
-            Some(sec) => format!("{sec:.2}"),
+        let start_val = match start_sec.filter(|&s| s > 0.05) {
+            Some(sec) => format!("{sec:.3}"),
             None => "none".into(),
         };
         let ck = CString::new("start").unwrap();
@@ -511,8 +511,12 @@ impl MpvPlayer {
     }
 
     pub fn seek_absolute(&self, sec: f64) {
-        let s = format!("{:.2}", sec.max(0.0));
-        self.cmd_async(&["seek", &s, "absolute"]);
+        let s = format!("{:.3}", sec.max(0.0));
+        self.cmd_async(&["seek", &s, "absolute+exact"]);
+    }
+
+    pub fn exact_position(&self) -> f64 {
+        self.get_double("time-pos").max(0.0)
     }
 
     pub fn set_volume(&self, vol: f64) {
