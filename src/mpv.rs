@@ -106,6 +106,19 @@ pub struct PlayerSnapshot {
     pub sub_delay: f64,
     pub sub_speed: f64,
     pub sub_scale: f64,
+    pub sub_pos: i64,
+    pub video_zoom: f64,
+    pub panscan: f64,
+    pub align_x: f64,
+    pub align_y: f64,
+    pub rotate: i64,
+    pub brightness: i64,
+    pub contrast: i64,
+    pub saturation: i64,
+    pub gamma: i64,
+    pub deband: bool,
+    pub audio_delay: f64,
+    pub pitch_correction: bool,
     pub audio_tracks: Vec<TrackInfo>,
     pub sub_tracks: Vec<TrackInfo>,
     pub active_aid: i64,
@@ -517,6 +530,124 @@ impl MpvPlayer {
         self.cmd_async(&["sub-add", path, "select"]);
     }
 
+    pub fn set_sub_pos(&self, pos: i64) {
+        self.set_int64("sub-pos", pos.clamp(0, 100));
+    }
+
+    pub fn reset_subs(&self) {
+        self.set_double("sub-delay", 0.0);
+        self.set_double("sub-speed", 1.0);
+        self.set_double("sub-scale", 1.0);
+        self.set_int64("sub-pos", 100);
+    }
+
+    // ---------- Video Studio ----------
+    pub fn set_video_zoom(&self, z: f64) {
+        self.set_double("video-zoom", z.clamp(-0.5, 1.5));
+    }
+
+    pub fn set_panscan(&self, p: f64) {
+        self.set_double("panscan", p.clamp(0.0, 1.0));
+    }
+
+    pub fn set_aspect_mode(&self, mode: &str) {
+        match mode {
+            "stretch" => {
+                self.set_flag("keepaspect", false);
+                self.set_string("video-aspect-override", "-1");
+            }
+            "auto" => {
+                self.set_flag("keepaspect", true);
+                self.set_string("video-aspect-override", "-1");
+            }
+            other => {
+                self.set_flag("keepaspect", true);
+                self.set_string("video-aspect-override", other);
+            }
+        }
+    }
+
+    pub fn set_video_align_x(&self, x: f64) {
+        self.set_double("video-align-x", x.clamp(-1.0, 1.0));
+    }
+
+    pub fn set_video_align_y(&self, y: f64) {
+        self.set_double("video-align-y", y.clamp(-1.0, 1.0));
+    }
+
+    pub fn set_video_rotate(&self, deg: i64) {
+        self.set_int64("video-rotate", deg.rem_euclid(360));
+    }
+
+    pub fn set_upscaler(&self, scaler: &str) {
+        self.set_string("scale", scaler);
+    }
+
+    pub fn set_deband(&self, on: bool) {
+        self.set_flag("deband", on);
+    }
+
+    pub fn set_brightness(&self, v: i64) {
+        self.set_int64("brightness", v.clamp(-50, 50));
+    }
+
+    pub fn set_contrast(&self, v: i64) {
+        self.set_int64("contrast", v.clamp(-50, 50));
+    }
+
+    pub fn set_saturation(&self, v: i64) {
+        self.set_int64("saturation", v.clamp(-50, 50));
+    }
+
+    pub fn set_gamma(&self, v: i64) {
+        self.set_int64("gamma", v.clamp(-50, 50));
+    }
+
+    pub fn reset_video(&self) {
+        self.set_double("video-zoom", 0.0);
+        self.set_double("panscan", 0.0);
+        self.set_flag("keepaspect", true);
+        self.set_string("video-aspect-override", "-1");
+        self.set_double("video-align-x", 0.0);
+        self.set_double("video-align-y", 0.0);
+        self.set_int64("video-rotate", 0);
+        self.set_string("scale", "spline36");
+        self.set_flag("deband", false);
+        self.set_int64("brightness", 0);
+        self.set_int64("contrast", 0);
+        self.set_int64("saturation", 0);
+        self.set_int64("gamma", 0);
+    }
+
+    // ---------- Audio Studio ----------
+    pub fn set_audio_delay(&self, sec: f64) {
+        self.set_double("audio-delay", sec.clamp(-5.0, 5.0));
+    }
+
+    pub fn set_pitch_correction(&self, on: bool) {
+        self.set_flag("audio-pitch-correction", on);
+    }
+
+    pub fn set_night_mode(&self, on: bool) {
+        if on {
+            self.set_string("af", "lavfi=[dynaudnorm=f=150:g=15]");
+        } else {
+            self.set_string("af", "");
+        }
+    }
+
+    pub fn set_stereo_downmix(&self, on: bool) {
+        self.set_string("audio-channels", if on { "stereo" } else { "auto-safe" });
+    }
+
+    pub fn reset_audio(&self) {
+        self.set_double("volume", 100.0);
+        self.set_double("audio-delay", 0.0);
+        self.set_flag("audio-pitch-correction", true);
+        self.set_string("af", "");
+        self.set_string("audio-channels", "auto-safe");
+    }
+
     fn set_flag(&self, name: &str, val: bool) {
         let cname = CString::new(name).unwrap();
         let mut v: c_int = if val { 1 } else { 0 };
@@ -689,6 +820,26 @@ impl MpvPlayer {
                 }
             },
             sub_scale: self.get_double("sub-scale").max(0.5),
+            sub_pos: {
+                let sp = self.get_int64("sub-pos");
+                if sp == 0 && !self.get_flag("sub-visibility") {
+                    100
+                } else {
+                    sp
+                }
+            },
+            video_zoom: self.get_double("video-zoom"),
+            panscan: self.get_double("panscan"),
+            align_x: self.get_double("video-align-x"),
+            align_y: self.get_double("video-align-y"),
+            rotate: self.get_int64("video-rotate"),
+            brightness: self.get_int64("brightness"),
+            contrast: self.get_int64("contrast"),
+            saturation: self.get_int64("saturation"),
+            gamma: self.get_int64("gamma"),
+            deband: self.get_flag("deband"),
+            audio_delay: self.get_double("audio-delay"),
+            pitch_correction: self.get_flag("audio-pitch-correction"),
             audio_tracks,
             sub_tracks,
             active_aid,

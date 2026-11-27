@@ -64,13 +64,16 @@ jobs:
           done
           iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
 
+          # Stage libmpv outside Frameworks so dylibbundler -cd doesn't wipe it
+          mkdir -p stage
           MPV_LIB="$(brew --prefix mpv)/lib/libmpv.2.dylib"
-          cp -L "$MPV_LIB" "$APP/Contents/Frameworks/libmpv.2.dylib"
-          chmod +w "$APP/Contents/Frameworks/libmpv.2.dylib"
-          dylibbundler -od -b \
-            -x "$APP/Contents/Frameworks/libmpv.2.dylib" \
+          cp -L "$MPV_LIB" stage/libmpv.2.dylib
+          chmod +w stage/libmpv.2.dylib
+          dylibbundler -cd -b \
+            -x stage/libmpv.2.dylib \
             -d "$APP/Contents/Frameworks" \
             -p "@loader_path/"
+          cp stage/libmpv.2.dylib "$APP/Contents/Frameworks/libmpv.2.dylib"
 
           cat > "$APP/Contents/Info.plist" << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -84,6 +87,21 @@ jobs:
             <key>CFBundleShortVersionString</key><string>0.1.0</string>
             <key>CFBundleIconFile</key><string>icon.icns</string>
             <key>NSHighResolutionCapable</key><true/>
+            <key>CFBundleDocumentTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleTypeName</key><string>Video File</string>
+                <key>CFBundleTypeRole</key><string>Viewer</string>
+                <key>LSHandlerRank</key><string>Alternate</string>
+                <key>CFBundleTypeExtensions</key>
+                <array>
+                  <string>mkv</string><string>mp4</string><string>mov</string>
+                  <string>m4v</string><string>webm</string><string>avi</string>
+                  <string>ts</string><string>m2ts</string><string>flv</string>
+                  <string>wmv</string><string>part</string><string>crdownload</string>
+                </array>
+              </dict>
+            </array>
           </dict>
           </plist>
           EOF
