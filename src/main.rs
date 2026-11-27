@@ -195,8 +195,99 @@ fn is_photo_ext(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(|s| s.to_ascii_lowercase())
             .as_deref(),
-        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tiff" | "tif")
+        Some(
+            "jpg"
+                | "jpeg"
+                | "png"
+                | "webp"
+                | "gif"
+                | "bmp"
+                | "tiff"
+                | "tif"
+                | "heic"
+                | "heif"
+                | "avif"
+                | "jxl"
+                | "dng"
+        )
     )
+}
+
+/// Decodes any photo format (JPG/PNG/WebP/GIF/BMP/TIFF natively, HEIC/HEIF/AVIF/DNG via
+/// macOS Apple ImageIO `sips` or cross-platform `ffmpeg`).
+fn decode_any_photo(path: &Path, max_dim: u32) -> Option<ColorImage> {
+    let img = if let Ok(i) = image::open(path) {
+        if i.width().max(i.height()) > max_dim {
+            i.thumbnail(max_dim, max_dim)
+        } else {
+            i
+        }
+    } else {
+        // Fallback 1 (macOS): native Apple ImageIO via `sips` (handles HEIC, HEIF, AVIF, DNG/RAW)
+        #[cfg(target_os = "macos")]
+        let decoded = {
+            let tmp = std::env::temp_dir().join(format!(
+                "streamd_img_{:x}.jpg",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let ok = std::process::Command::new("sips")
+                .args([
+                    "-s",
+                    "format",
+                    "jpeg",
+                    "-Z",
+                    &max_dim.to_string(),
+                    &path.to_string_lossy(),
+                    "--out",
+                    &tmp.to_string_lossy(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_or(false, |s| s.success());
+            let loaded = if ok { image::open(&tmp).ok() } else { None };
+            let _ = std::fs::remove_file(&tmp);
+            loaded
+        };
+        #[cfg(not(target_os = "macos"))]
+        let decoded: Option<image::DynamicImage> = None;
+
+        // Fallback 2 (cross-platform): ffmpeg image decode
+        if let Some(d) = decoded {
+            d
+        } else {
+            let out = std::process::Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-i",
+                    &path.to_string_lossy(),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    &format!("scale='min(iw,{max_dim})':-2"),
+                    "-f",
+                    "mjpeg",
+                    "pipe:1",
+                ])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            if !out.status.success() || out.stdout.is_empty() {
+                return None;
+            }
+            image::load_from_memory(&out.stdout).ok()?
+        }
+    };
+
+    let rgba = img.to_rgba8();
+    Some(ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
 }
 
 fn is_video_ext(path: &Path) -> bool {
@@ -821,6 +912,7 @@ struct StreamdApp {
     folder_carousel_target: usize,
     folder_carousel_pos: f32,
     scroll_accum: f32,
+    dismiss_y: f32,
     last_scroll_step: Instant,
     expand_t: f32,
     morph_start: Instant,
@@ -955,6 +1047,7 @@ impl StreamdApp {
             folder_carousel_target: 0,
             folder_carousel_pos: 0.0,
             scroll_accum: 0.0,
+            dismiss_y: 0.0,
             last_scroll_step: Instant::now() - Duration::from_secs(1),
             expand_t: 0.0,
             morph_start: Instant::now() - Duration::from_secs(1),
@@ -1048,17 +1141,7 @@ impl StreamdApp {
         let tx = self.card_thumb_tx.clone();
         let egui_ctx = ctx.clone();
         std::thread::spawn(move || {
-            if let Ok(img) = image::open(&path) {
-                let thumb = if img.width().max(img.height()) > max_dim {
-                    img.thumbnail(max_dim, max_dim)
-                } else {
-                    img
-                };
-                let rgba = thumb.to_rgba8();
-                let ci = ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    rgba.as_raw(),
-                );
+            if let Some(ci) = decode_any_photo(&path, max_dim) {
                 let _ = tx.send((source_key, true, ci));
                 egui_ctx.request_repaint();
             }
@@ -1210,21 +1293,11 @@ impl StreamdApp {
         });
         self.last_mouse_move = Instant::now();
 
-        // Decode full-resolution photo off the UI thread (zero stutter!)
+        // Decode full-resolution photo (including HEIC/HEIF/AVIF/DNG!) off the UI thread
         let tx = self.photo_tx.clone();
         let egui_ctx = ctx.clone();
         std::thread::spawn(move || {
-            if let Ok(img) = image::open(&path) {
-                let resized = if img.width().max(img.height()) > 3840 {
-                    img.thumbnail(3840, 3840)
-                } else {
-                    img
-                };
-                let rgba = resized.to_rgba8();
-                let ci = ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    rgba.as_raw(),
-                );
+            if let Some(ci) = decode_any_photo(&path, 3840) {
                 let _ = tx.send((src, ci));
                 egui_ctx.request_repaint();
             }
@@ -2061,12 +2134,17 @@ impl StreamdApp {
             *c_target = total_cards - 1;
         }
 
-        // Debounced Cover-Flow navigation: 1 trackpad swipe = exactly 1 card
+        // Debounced Cover-Flow navigation (horizontal swipe = left/right, vertical swipe up = iOS dismiss!)
         let mut exit_folder = false;
+        let mut dismiss_current = false;
+        let can_dismiss = in_folder.is_some() || *c_target > 0;
         if !ctx.wants_keyboard_input() && total_cards > 0 {
             ctx.input(|i| {
                 if in_folder.is_some() && i.key_pressed(Key::Escape) {
                     exit_folder = true;
+                }
+                if can_dismiss && (i.key_pressed(Key::Backspace) || i.key_pressed(Key::Delete)) {
+                    dismiss_current = true;
                 }
                 if total_cards > 1 {
                     if i.key_pressed(Key::ArrowRight) && *c_target + 1 < total_cards {
@@ -2075,32 +2153,74 @@ impl StreamdApp {
                     if i.key_pressed(Key::ArrowLeft) && *c_target > 0 {
                         *c_target -= 1;
                     }
-                    let scroll = if i.raw_scroll_delta.x.abs() > i.raw_scroll_delta.y.abs() {
-                        i.raw_scroll_delta.x
-                    } else {
-                        i.raw_scroll_delta.y
-                    };
-                    if scroll.abs() > 0.5 {
-                        self.scroll_accum += scroll;
-                        if self.last_scroll_step.elapsed() >= Duration::from_millis(260) {
-                            if self.scroll_accum < -38.0 && *c_target + 1 < total_cards {
-                                *c_target += 1;
-                                self.scroll_accum = 0.0;
-                                self.last_scroll_step = Instant::now();
-                            } else if self.scroll_accum > 38.0 && *c_target > 0 {
-                                *c_target -= 1;
-                                self.scroll_accum = 0.0;
-                                self.last_scroll_step = Instant::now();
-                            }
+                }
+                let dx = i.raw_scroll_delta.x;
+                let dy = i.raw_scroll_delta.y;
+                if dx.abs() > dy.abs() && dx.abs() > 0.5 && total_cards > 1 {
+                    self.scroll_accum += dx;
+                    if self.last_scroll_step.elapsed() >= Duration::from_millis(260) {
+                        if self.scroll_accum < -38.0 && *c_target + 1 < total_cards {
+                            *c_target += 1;
+                            self.scroll_accum = 0.0;
+                            self.last_scroll_step = Instant::now();
+                        } else if self.scroll_accum > 38.0 && *c_target > 0 {
+                            *c_target -= 1;
+                            self.scroll_accum = 0.0;
+                            self.last_scroll_step = Instant::now();
                         }
-                    } else {
-                        self.scroll_accum *= 0.8;
+                    }
+                } else if can_dismiss && dy.abs() > dx.abs() && dy > 1.5 {
+                    // Two-finger swipe UP lifts the centered card out of Cover Flow!
+                    self.dismiss_y = (self.dismiss_y - dy * 1.15).max(-180.0);
+                    if self.dismiss_y <= -95.0 {
+                        dismiss_current = true;
+                        self.dismiss_y = 0.0;
+                    }
+                } else {
+                    self.scroll_accum *= 0.8;
+                    self.dismiss_y *= 1.0 - (dt * 12.0).min(1.0);
+                    if self.dismiss_y.abs() < 0.5 {
+                        self.dismiss_y = 0.0;
                     }
                 }
             });
         }
         if exit_folder {
             self.active_folder = None;
+            self.dismiss_y = 0.0;
+            return;
+        }
+        if dismiss_current {
+            let mut removed_src: Option<String> = None;
+            if let Some(fi) = in_folder {
+                let mut now_empty = false;
+                let mut new_len = 0;
+                if let Some(folder) = self.library.get_mut(fi) {
+                    if self.folder_carousel_target < folder.children.len() {
+                        removed_src =
+                            Some(folder.children.remove(self.folder_carousel_target).source);
+                        now_empty = folder.children.is_empty();
+                        new_len = folder.children.len();
+                    }
+                }
+                if now_empty {
+                    self.active_folder = None;
+                } else if new_len > 0 && self.folder_carousel_target >= new_len {
+                    self.folder_carousel_target = new_len - 1;
+                }
+            } else if self.carousel_target > 0 && self.carousel_target - 1 < self.library.len() {
+                removed_src = Some(self.library.remove(self.carousel_target - 1).source);
+                if self.carousel_target > self.library.len() {
+                    self.carousel_target = self.library.len();
+                }
+            }
+            if let Some(src) = removed_src {
+                if self.session_source == src {
+                    self.destroy_active_session();
+                }
+            }
+            self.dismiss_y = 0.0;
+            ctx.request_repaint();
             return;
         }
 
@@ -2349,8 +2469,11 @@ impl StreamdApp {
                     if d.abs() > 2.6 {
                         continue;
                     }
-                    let (cr, dim) = card_geom(d);
+                    let (mut cr, dim) = card_geom(d);
                     let is_center = idx == cur_target && d.abs() < 0.15;
+                    if is_center && !is_input_card(idx) && self.dismiss_y < -0.5 {
+                        cr = cr.translate(Vec2::new(0.0, self.dismiss_y));
+                    }
 
                     if is_input_card(idx) {
                         ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_PAPER);
