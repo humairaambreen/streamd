@@ -559,6 +559,15 @@ fn labeled_bar(
     (changed, reset)
 }
 
+#[derive(Clone)]
+struct LibraryItem {
+    name: String,
+    source: String, // URL or local path
+    is_local: bool,
+    position: f64,
+    duration: f64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OptTab {
     Audio,
@@ -580,9 +589,8 @@ struct StreamdApp {
     engine: Arc<Engine>,
     mpv: Option<Arc<MpvPlayer>>,
     mpv_err: Option<String>,
-    logo_tex: Option<TextureHandle>,
 
-    // Home inputs
+    // Home Cover-Flow stage & inputs
     url: String,
     show_hdrs: bool,
     hdrs_anim: f32,
@@ -593,6 +601,9 @@ struct StreamdApp {
     opening: bool,
     open_rx: Option<mpsc::Receiver<anyhow::Result<SessionMeta>>>,
     err_msg: String,
+    library: Vec<LibraryItem>,
+    carousel_target: usize,
+    carousel_pos: f32,
 
     // Active session & Play Next queue
     session: Option<SessionMeta>,
@@ -674,18 +685,6 @@ impl StreamdApp {
         visuals.selection.stroke = Stroke::NONE;
         cc.egui_ctx.set_visuals(visuals);
 
-        let logo_tex = image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png)
-            .ok()
-            .map(|img| {
-                let rgba = img.to_rgba8();
-                let ci = ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    rgba.as_raw(),
-                );
-                cc.egui_ctx
-                    .load_texture("streamd_logo", ci, TextureOptions::LINEAR)
-            });
-
         let (mpv, mpv_err) = match cc.get_proc_address {
             Some(gpa) => match MpvPlayer::new(cc.egui_ctx.clone(), gpa) {
                 Ok(p) => (Some(p), None),
@@ -700,7 +699,6 @@ impl StreamdApp {
             engine,
             mpv,
             mpv_err,
-            logo_tex,
             url: String::new(),
             show_hdrs: false,
             hdrs_anim: 0.0,
@@ -711,6 +709,9 @@ impl StreamdApp {
             opening: false,
             open_rx: None,
             err_msg: String::new(),
+            library: Vec::new(),
+            carousel_target: 0,
+            carousel_pos: 0.0,
             session: None,
             queue: Vec::new(),
             queue_idx: 0,
@@ -839,6 +840,30 @@ impl StreamdApp {
         self.sub_query = t;
         self.sub_results.clear();
         self.sub_msg.clear();
+
+        // Record in Cover-Flow library cards
+        let source = if meta.is_local {
+            meta.media_url.clone()
+        } else {
+            self.url.trim().to_string()
+        };
+        if !source.is_empty() {
+            if let Some(existing) = self.library.iter_mut().find(|x| x.source == source) {
+                existing.name = meta.name.clone();
+            } else {
+                self.library.insert(
+                    0,
+                    LibraryItem {
+                        name: meta.name.clone(),
+                        source,
+                        is_local: meta.is_local,
+                        position: 0.0,
+                        duration: 0.0,
+                    },
+                );
+            }
+        }
+
         if let Some(mpv) = &self.mpv {
             mpv.load_url(&meta.media_url);
         }
@@ -847,6 +872,20 @@ impl StreamdApp {
     }
 
     fn close_session(&mut self) {
+        // Save last watched progress onto the Cover-Flow card
+        if let Some(s) = &self.session {
+            let src = if s.is_local {
+                s.media_url.clone()
+            } else {
+                self.url.trim().to_string()
+            };
+            if let Some(item) = self.library.iter_mut().find(|x| x.source == src) {
+                if self.snap.duration > 0.0 {
+                    item.position = self.snap.position;
+                    item.duration = self.snap.duration;
+                }
+            }
+        }
         self.thumb_gen.fetch_add(1, Relaxed);
         if let Some(mpv) = &self.mpv {
             mpv.stop();
@@ -1047,190 +1086,426 @@ impl StreamdApp {
 
     fn draw_home(&mut self, ctx: &egui::Context) {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        let target_h = if self.show_hdrs { 1.0 } else { 0.0 };
+        let total_cards = 1 + self.library.len();
+        if self.carousel_target >= total_cards {
+            self.carousel_target = total_cards.saturating_sub(1);
+        }
+
+        // Keyboard / scroll-wheel Cover-Flow navigation (when not typing in text input)
+        if !ctx.wants_keyboard_input() && total_cards > 1 {
+            ctx.input(|i| {
+                if i.key_pressed(Key::ArrowRight) && self.carousel_target + 1 < total_cards {
+                    self.carousel_target += 1;
+                }
+                if i.key_pressed(Key::ArrowLeft) && self.carousel_target > 0 {
+                    self.carousel_target -= 1;
+                }
+                let scroll = i.raw_scroll_delta.x + i.raw_scroll_delta.y;
+                if scroll < -28.0 && self.carousel_target + 1 < total_cards {
+                    self.carousel_target += 1;
+                } else if scroll > 28.0 && self.carousel_target > 0 {
+                    self.carousel_target -= 1;
+                }
+            });
+        }
+
+        let target_f = self.carousel_target as f32;
+        self.carousel_pos += (target_f - self.carousel_pos) * (dt * 12.0).min(1.0);
+        let target_h = if self.show_hdrs && self.carousel_target == 0 {
+            1.0
+        } else {
+            0.0
+        };
         self.hdrs_anim += (target_h - self.hdrs_anim) * (dt * 14.0).min(1.0);
-        if (self.hdrs_anim - target_h).abs() > 0.002 {
+
+        if (self.carousel_pos - target_f).abs() > 0.002 || (self.hdrs_anim - target_h).abs() > 0.002
+        {
             ctx.request_repaint();
         }
 
+        const BG: Color32 = Color32::from_rgb(14, 14, 15); // #0E0E0F
+        const CARD_DARK: Color32 = Color32::from_rgb(37, 37, 40); // #252528
+        const CARD_EDGE: Color32 = Color32::from_rgb(58, 58, 61); // #3A3A3D
+        const CARD_PAPER: Color32 = Color32::from_rgb(232, 232, 227); // #E8E8E3
+        const ACCENT_BLUE: Color32 = Color32::from_rgb(77, 148, 255); // #4D94FF
+        const TEXT_MAIN: Color32 = Color32::from_rgb(232, 232, 227);
+
+        let mut open_card_idx: Option<usize> = None;
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::BLACK))
+            .frame(egui::Frame::NONE.fill(BG))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
-                let w = rect.width().min(600.0);
-                let block_h = 160.0 + expo_out(self.hdrs_anim) * 170.0;
-                let top = (rect.height() - block_h) * 0.46;
-                let area_rect = Rect::from_min_size(
-                    Pos2::new(rect.center().x - w * 0.5, top.max(32.0)),
-                    Vec2::new(w, block_h + 140.0),
-                );
+                let cx = rect.center().x;
+                let cy = rect.center().y - 34.0;
+                let scale = (rect.width() / 960.0).clamp(0.85, 1.35);
 
-                ui.scope_builder(egui::UiBuilder::new().max_rect(area_rect), |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 12.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(10.0, 0.0);
-                        if let Some(tex) = &self.logo_tex {
-                            ui.image(egui::load::SizedTexture::new(tex.id(), Vec2::splat(32.0)));
-                        }
-                        ui.label(
-                            egui::RichText::new("streamd")
-                                .size(28.0)
-                                .color(Color32::WHITE),
-                        );
-                    });
+                // Compute smooth Cover-Flow geometry for each card index relative to carousel_pos
+                let card_geom = |d: f32| -> (Rect, f32) {
+                    let ad = d.abs();
+                    // Interpolate width: 400 at d=0, 288 at d=1, 220 at d=2
+                    let w = if ad <= 1.0 {
+                        400.0 + (288.0 - 400.0) * ad
+                    } else {
+                        (288.0 + (220.0 - 288.0) * (ad - 1.0).min(1.0)).max(180.0)
+                    } * scale;
+                    let h = w * 9.0 / 16.0;
+                    // Smooth x offset matching mockup (300px step at 1x, compressing further out)
+                    let sign = if d >= 0.0 { 1.0 } else { -1.0 };
+                    let x_off = if ad <= 1.0 {
+                        sign * ad * 300.0 * scale
+                    } else {
+                        sign * (300.0 + (ad - 1.0) * 190.0) * scale
+                    };
+                    let dim = if ad <= 1.0 {
+                        ad * 0.45
+                    } else {
+                        (0.45 + (ad - 1.0) * 0.25).min(0.78)
+                    };
+                    let r = Rect::from_center_size(Pos2::new(cx + x_off, cy), Vec2::new(w, h));
+                    (r, dim)
+                };
 
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::ZERO;
-                        let btn_w = 88.0;
-                        let te = egui::TextEdit::singleline(&mut self.url)
-                            .hint_text("Paste direct video URL or drop any video")
-                            .frame(false)
-                            .margin(Margin::symmetric(14, 12))
-                            .desired_width(w - btn_w);
+                // Depth sort: furthest from center first so focal card renders on top
+                let mut order: Vec<usize> = (0..total_cards).collect();
+                order.sort_by(|&a, &b| {
+                    let da = (a as f32 - self.carousel_pos).abs();
+                    let db = (b as f32 - self.carousel_pos).abs();
+                    db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+                });
 
-                        let bg = Rect::from_min_size(ui.cursor().min, Vec2::new(w - btn_w, 42.0));
-                        ui.painter().rect_filled(
-                            bg,
+                // 1. Floor reflections beneath each visible card
+                for &idx in &order {
+                    let d = idx as f32 - self.carousel_pos;
+                    if d.abs() > 2.6 {
+                        continue;
+                    }
+                    let (cr, dim) = card_geom(d);
+                    let ref_h = (cr.height() * 0.42).min(95.0 * scale);
+                    let rr = Rect::from_min_size(
+                        Pos2::new(cr.left(), cr.bottom() + 3.0),
+                        Vec2::new(cr.width(), ref_h),
+                    );
+                    let base_col = if idx == 0 { CARD_PAPER } else { CARD_DARK };
+                    let top_a = ((1.0 - dim) * 95.0) as u8;
+                    paint_fade_v(
+                        ui.painter(),
+                        rr,
+                        Color32::from_rgba_unmultiplied(
+                            base_col.r(),
+                            base_col.g(),
+                            base_col.b(),
+                            top_a,
+                        ),
+                        Color32::TRANSPARENT,
+                    );
+                }
+
+                // 2. Render Cover-Flow cards back-to-front
+                for &idx in &order {
+                    let d = idx as f32 - self.carousel_pos;
+                    if d.abs() > 2.6 {
+                        continue;
+                    }
+                    let (cr, dim) = card_geom(d);
+                    let is_center = idx == self.carousel_target && d.abs() < 0.15;
+
+                    if idx == 0 {
+                        // Card 0: Warm off-white Input Card (.pn)
+                        ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_PAPER);
+                        ui.painter().rect_stroke(
+                            cr,
                             CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+                            Stroke::new(1.0_f32, Color32::WHITE),
+                            egui::StrokeKind::Inside,
                         );
-                        let resp = ui.add_sized(Vec2::new(w - btn_w, 42.0), te);
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                            self.start_open_url();
-                        }
 
-                        let can_play =
-                            !self.opening && !self.url.trim().is_empty() && self.mpv.is_some();
-                        let btn_fill = if can_play {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 50)
-                        };
-                        let btn = egui::Button::new(
-                            egui::RichText::new(if self.opening { "Opening" } else { "Play" })
-                                .color(Color32::BLACK)
-                                .size(14.0),
-                        )
-                        .fill(btn_fill)
-                        .stroke(Stroke::NONE)
-                        .corner_radius(CornerRadius::ZERO);
-                        if ui.add_sized(Vec2::new(btn_w, 42.0), btn).clicked() && can_play {
-                            self.start_open_url();
-                        }
-                    });
+                        let pad_x = cr.width() * 0.07;
+                        let bar_h = (48.0 * (cr.width() / (400.0 * scale))).clamp(28.0, 52.0);
+                        let bar_r = Rect::from_min_size(
+                            Pos2::new(cr.left() + pad_x, cr.center().y - bar_h * 0.5),
+                            Vec2::new(cr.width() - pad_x * 2.0, bar_h),
+                        );
+                        ui.painter()
+                            .rect_filled(bar_r, CornerRadius::ZERO, Color32::WHITE);
 
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(16.0, 0.0);
-                        let hdr_btn = egui::Button::new(
-                            egui::RichText::new(if self.show_hdrs {
-                                "− Headers / Resume"
-                            } else {
-                                "+ Headers / Resume"
-                            })
-                            .size(12.5)
-                            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 130)),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::NONE);
-                        if ui.add(hdr_btn).clicked() {
-                            self.show_hdrs = !self.show_hdrs;
-                        }
+                        let plus_r = Rect::from_min_size(
+                            Pos2::new(bar_r.right() - bar_h, bar_r.top()),
+                            Vec2::new(bar_h, bar_h),
+                        );
+                        ui.painter().rect_filled(plus_r, CornerRadius::ZERO, BG);
+                        // Crisp '+' vector icon
+                        let pc = plus_r.center();
+                        let arm = bar_h * 0.17;
+                        let pst = Stroke::new(2.0_f32, TEXT_MAIN);
+                        ui.painter().line_segment(
+                            [Pos2::new(pc.x, pc.y - arm), Pos2::new(pc.x, pc.y + arm)],
+                            pst,
+                        );
+                        ui.painter().line_segment(
+                            [Pos2::new(pc.x - arm, pc.y), Pos2::new(pc.x + arm, pc.y)],
+                            pst,
+                        );
 
-                        let open_btn = egui::Button::new(
-                            egui::RichText::new("Open Video / .part")
-                                .size(12.5)
-                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 130)),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::NONE);
-                        if ui.add(open_btn).clicked() {
-                            if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                self.open_local_path(p, true);
-                            }
-                        }
-                    });
-
-                    if self.hdrs_anim > 0.02 {
-                        let a = expo_out(self.hdrs_anim);
-                        ui.scope(|ui| {
-                            ui.set_opacity(a);
-                            ui.spacing_mut().item_spacing = Vec2::new(0.0, 6.0);
-                            for (val, hint) in [
-                                (&mut self.referer, "Referer"),
-                                (&mut self.cookie, "Cookie"),
-                                (&mut self.user_agent, "User-Agent"),
-                            ] {
-                                let r = Rect::from_min_size(ui.cursor().min, Vec2::new(w, 36.0));
-                                ui.painter().rect_filled(
-                                    r,
-                                    CornerRadius::ZERO,
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-                                );
-                                ui.add_sized(
-                                    Vec2::new(w, 36.0),
-                                    egui::TextEdit::singleline(val)
-                                        .hint_text(hint)
-                                        .frame(false)
-                                        .margin(Margin::symmetric(12, 9)),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
-                                let pick_seed = egui::Button::new(
-                                    egui::RichText::new(
-                                        "Attach partial file (.part / .crdownload)",
-                                    )
-                                    .size(12.0)
-                                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 180)),
-                                )
-                                .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 14));
-                                if ui.add(pick_seed).clicked() {
-                                    self.seed_file = rfd::FileDialog::new().pick_file();
-                                }
-                                if let Some(sf) = &self.seed_file.clone() {
-                                    let fname = sf
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("partial");
-                                    ui.label(
-                                        egui::RichText::new(fname)
-                                            .size(12.0)
-                                            .color(Color32::from_gray(160)),
-                                    );
-                                    if ui
-                                        .add(egui::Button::new("x").fill(Color32::TRANSPARENT))
-                                        .clicked()
-                                    {
-                                        self.seed_file = None;
-                                    }
+                        if is_center {
+                            let input_r = Rect::from_min_max(
+                                bar_r.min,
+                                Pos2::new(plus_r.left(), bar_r.bottom()),
+                            );
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(input_r), |ui| {
+                                ui.visuals_mut().override_text_color =
+                                    Some(Color32::from_rgb(20, 20, 22));
+                                ui.visuals_mut().selection.bg_fill =
+                                    Color32::from_rgba_unmultiplied(77, 148, 255, 70);
+                                let te = egui::TextEdit::singleline(&mut self.url)
+                                    .hint_text("Paste a link or open a file")
+                                    .font(FontId::monospace(12.5))
+                                    .frame(false)
+                                    .margin(Margin::symmetric(12, ((bar_h - 18.0) * 0.5) as i8))
+                                    .desired_width(input_r.width());
+                                let resp = ui.add_sized(input_r.size(), te);
+                                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                    self.start_open_url();
                                 }
                             });
+
+                            let plus_resp =
+                                ui.interact(plus_r, egui::Id::new("cf_plus_btn"), Sense::click());
+                            if plus_resp.clicked() {
+                                if !self.url.trim().is_empty() {
+                                    self.start_open_url();
+                                } else if let Some(p) = rfd::FileDialog::new().pick_file() {
+                                    self.open_local_path(p, true);
+                                }
+                            }
+                        } else {
+                            // Preview text inside non-centered input card
+                            ui.painter().text(
+                                Pos2::new(bar_r.left() + 12.0, bar_r.center().y),
+                                Align2::LEFT_CENTER,
+                                "Paste a link or open a file",
+                                FontId::monospace((11.5 * (cr.width() / (400.0 * scale))).max(8.5)),
+                                Color32::from_rgb(85, 85, 79),
+                            );
+                            if ui
+                                .interact(cr, egui::Id::new("cf_card_0"), Sense::click())
+                                .clicked()
+                            {
+                                self.carousel_target = 0;
+                            }
+                        }
+                    } else {
+                        // Video Library Card (.th)
+                        let item = &self.library[idx - 1];
+                        ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_DARK);
+                        ui.painter().rect_stroke(
+                            cr,
+                            CornerRadius::ZERO,
+                            Stroke::new(1.0_f32, CARD_EDGE),
+                            egui::StrokeKind::Inside,
+                        );
+
+                        // Subtle centered Play triangle on focal card
+                        if is_center {
+                            draw_play(
+                                ui.painter(),
+                                cr,
+                                Color32::from_rgba_unmultiplied(232, 232, 227, 175),
+                            );
+                        }
+
+                        // Bottom status row: filename left, timestamp/NEW right
+                        let fs = (11.5 * (cr.width() / (400.0 * scale))).clamp(9.0, 12.5);
+                        let status_str = if item.duration > 0.0 {
+                            format!("{} / {}", fmt_time(item.position), fmt_time(item.duration))
+                        } else {
+                            "NEW".into()
+                        };
+                        let short_name: String = item.name.chars().take(24).collect();
+                        ui.painter().text(
+                            Pos2::new(cr.left() + 10.0, cr.bottom() - 14.0),
+                            Align2::LEFT_CENTER,
+                            short_name,
+                            FontId::monospace(fs),
+                            TEXT_MAIN,
+                        );
+                        ui.painter().text(
+                            Pos2::new(cr.right() - 10.0, cr.bottom() - 14.0),
+                            Align2::RIGHT_CENTER,
+                            status_str,
+                            FontId::monospace(fs),
+                            TEXT_MAIN,
+                        );
+
+                        // 3px bottom progress bar (#3A3A3D track, #4D94FF fill)
+                        let pg_r = Rect::from_min_size(
+                            Pos2::new(cr.left(), cr.bottom() - 3.0),
+                            Vec2::new(cr.width(), 3.0),
+                        );
+                        ui.painter()
+                            .rect_filled(pg_r, CornerRadius::ZERO, CARD_EDGE);
+                        if item.duration > 0.0 {
+                            let pct = (item.position / item.duration).clamp(0.0, 1.0) as f32;
+                            ui.painter().rect_filled(
+                                Rect::from_min_size(pg_r.min, Vec2::new(pg_r.width() * pct, 3.0)),
+                                CornerRadius::ZERO,
+                                ACCENT_BLUE,
+                            );
+                        }
+
+                        let resp = ui.interact(cr, egui::Id::new(("cf_card", idx)), Sense::click());
+                        if resp.clicked() {
+                            if is_center {
+                                open_card_idx = Some(idx - 1);
+                            } else {
+                                self.carousel_target = idx;
+                            }
+                        }
+                    }
+
+                    // Smooth distance dim overlay (.dim)
+                    if dim > 0.01 {
+                        ui.painter().rect_filled(
+                            cr,
+                            CornerRadius::ZERO,
+                            Color32::from_rgba_unmultiplied(14, 14, 15, (dim * 255.0) as u8),
+                        );
+                    }
+                }
+
+                // Enter key opens the currently focused video card
+                if !ctx.wants_keyboard_input()
+                    && self.carousel_target > 0
+                    && ctx.input(|i| i.key_pressed(Key::Enter))
+                {
+                    open_card_idx = Some(self.carousel_target - 1);
+                }
+
+                // Subtle bottom utility row (Headers / Resume & Status/Errors)
+                let foot_w = 400.0 * scale;
+                let foot_y = cy + (400.0 * scale * 9.0 / 16.0) * 0.5 + 36.0;
+                let foot_r = Rect::from_min_size(
+                    Pos2::new(cx - foot_w * 0.5, foot_y),
+                    Vec2::new(foot_w, 220.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(foot_r), |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
+                    if self.carousel_target == 0 {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(16.0, 0.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(if self.show_hdrs {
+                                            "− headers"
+                                        } else {
+                                            "+ headers / resume"
+                                        })
+                                        .font(FontId::monospace(11.5))
+                                        .color(Color32::from_gray(120)),
+                                    )
+                                    .fill(Color32::TRANSPARENT),
+                                )
+                                .clicked()
+                            {
+                                self.show_hdrs = !self.show_hdrs;
+                            }
+                            if self.opening {
+                                ui.label(
+                                    egui::RichText::new("opening…")
+                                        .font(FontId::monospace(11.5))
+                                        .color(ACCENT_BLUE),
+                                );
+                            }
                         });
+
+                        if self.hdrs_anim > 0.02 {
+                            let a = expo_out(self.hdrs_anim);
+                            ui.scope(|ui| {
+                                ui.set_opacity(a);
+                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 5.0);
+                                for (val, hint) in [
+                                    (&mut self.referer, "Referer"),
+                                    (&mut self.cookie, "Cookie"),
+                                    (&mut self.user_agent, "User-Agent"),
+                                ] {
+                                    let r = Rect::from_min_size(
+                                        ui.cursor().min,
+                                        Vec2::new(foot_w, 32.0),
+                                    );
+                                    ui.painter().rect_filled(r, CornerRadius::ZERO, CARD_DARK);
+                                    ui.add_sized(
+                                        Vec2::new(foot_w, 32.0),
+                                        egui::TextEdit::singleline(val)
+                                            .hint_text(hint)
+                                            .font(FontId::monospace(11.5))
+                                            .frame(false)
+                                            .margin(Margin::symmetric(10, 7)),
+                                    );
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("attach .part / .crdownload")
+                                                    .font(FontId::monospace(11.0))
+                                                    .color(TEXT_MAIN),
+                                            )
+                                            .fill(CARD_DARK),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.seed_file = rfd::FileDialog::new().pick_file();
+                                    }
+                                    if let Some(sf) = &self.seed_file.clone() {
+                                        let n = sf
+                                            .file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("part");
+                                        ui.label(
+                                            egui::RichText::new(n)
+                                                .font(FontId::monospace(11.0))
+                                                .color(Color32::from_gray(150)),
+                                        );
+                                        if ui
+                                            .add(egui::Button::new("x").fill(Color32::TRANSPARENT))
+                                            .clicked()
+                                        {
+                                            self.seed_file = None;
+                                        }
+                                    }
+                                });
+                            });
+                        }
                     }
 
                     if let Some(e) = &self.mpv_err {
                         ui.label(
                             egui::RichText::new(e)
-                                .size(13.0)
-                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 210)),
+                                .font(FontId::monospace(11.5))
+                                .color(Color32::from_gray(200)),
                         );
                     }
                     if !self.err_msg.is_empty() {
-                        let r = Rect::from_min_size(ui.cursor().min, Vec2::new(w, 44.0));
-                        ui.painter().rect_filled(
-                            r,
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 18),
-                        );
-                        ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(&self.err_msg)
-                                .size(13.0)
-                                .color(Color32::from_rgba_unmultiplied(255, 255, 255, 225)),
+                                .font(FontId::monospace(11.5))
+                                .color(Color32::from_gray(220)),
                         );
                     }
                 });
             });
+
+        if let Some(li) = open_card_idx {
+            if let Some(item) = self.library.get(li).cloned() {
+                if item.is_local {
+                    self.open_local_path(PathBuf::from(item.source), true);
+                } else {
+                    self.url = item.source;
+                    self.start_open_url();
+                }
+            }
+        }
     }
 
     fn draw_player(&mut self, ctx: &egui::Context) {
