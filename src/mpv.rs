@@ -468,7 +468,12 @@ impl MpvPlayer {
         }
     }
 
-    pub fn load_url(&self, url: &str) {
+    pub fn load_url_at(&self, url: &str, start_sec: Option<f64>) {
+        if let Some(sec) = start_sec.filter(|&s| s > 0.5) {
+            self.set_string("start", &format!("{sec:.2}"));
+        } else {
+            self.set_string("start", "none");
+        }
         self.set_flag("pause", false);
         self.cmd_async(&["loadfile", url, "replace"]);
     }

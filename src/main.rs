@@ -593,16 +593,22 @@ fn more_options_row(ui: &mut egui::Ui, width: f32, label: &str) -> bool {
     resp.clicked()
 }
 
-fn draw_menu(p: &egui::Painter, r: Rect, col: Color32) {
+fn draw_gear(p: &egui::Painter, r: Rect, col: Color32) {
     let c = r.center();
-    let st = Stroke::new(1.5_f32, col);
-    for dy in [-4.0, 0.0, 4.0] {
+    let outer = 6.2_f32;
+    let tooth = 8.0_f32;
+    let inner = 2.6_f32;
+    p.circle_stroke(c, outer - 1.2, Stroke::new(1.6_f32, col));
+    p.circle_stroke(c, inner, Stroke::new(1.2_f32, col));
+    for i in 0..8 {
+        let ang = (i as f32) * std::f32::consts::FRAC_PI_4;
+        let (s, cs) = ang.sin_cos();
         p.line_segment(
             [
-                Pos2::new(c.x - 6.5, c.y + dy),
-                Pos2::new(c.x + 6.5, c.y + dy),
+                Pos2::new(c.x + cs * (outer - 0.8), c.y + s * (outer - 0.8)),
+                Pos2::new(c.x + cs * tooth, c.y + s * tooth),
             ],
-            st,
+            Stroke::new(2.0_f32, col),
         );
     }
 }
@@ -1104,7 +1110,8 @@ impl StreamdApp {
         }
 
         if let Some(mpv) = &self.mpv {
-            mpv.load_url(&meta.media_url);
+            let start_pos = self.pending_resume_pos.take();
+            mpv.load_url_at(&meta.media_url, start_pos);
         }
         self.session = Some(meta);
         self.last_mouse_move = Instant::now();
@@ -1447,72 +1454,107 @@ impl StreamdApp {
                     db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                // 1. Real mirrored floor reflections beneath each visible card
-                let refl_vis = 1.0 - expo_out(self.hdrs_anim);
-                if refl_vis > 0.02 {
-                    for &idx in &order {
-                        let d = idx as f32 - self.carousel_pos;
-                        if d.abs() > 2.6 {
-                            continue;
-                        }
-                        let (cr, dim) = card_geom(d);
-                        let is_center = idx == self.carousel_target && d.abs() < 0.15;
-                        let ref_h = (cr.height() * 0.36).min(84.0 * scale);
-                        let rr = Rect::from_min_size(
-                            Pos2::new(cr.left(), cr.bottom() + 2.0),
-                            Vec2::new(cr.width(), ref_h),
-                        );
+                // 1. Real blurred mirrored floor reflections (always visible, soft cubic fade — no hard edge!)
+                for &idx in &order {
+                    let d = idx as f32 - self.carousel_pos;
+                    if d.abs() > 2.6 {
+                        continue;
+                    }
+                    let (cr, dim) = card_geom(d);
+                    let is_center = idx == self.carousel_target && d.abs() < 0.15;
+                    let ref_h = (cr.height() * 0.44).min(104.0 * scale);
+                    let rr = Rect::from_min_size(
+                        Pos2::new(cr.left(), cr.bottom() + 2.0),
+                        Vec2::new(cr.width(), ref_h),
+                    );
 
-                        if idx == 0 {
-                            let top_a = ((1.0 - dim) * 65.0 * refl_vis) as u8;
+                    if idx == 0 {
+                        let mid_y = rr.top() + ref_h * 0.45;
+                        let top_a = ((1.0 - dim) * 58.0) as u8;
+                        let mid_a = ((1.0 - dim) * 14.0) as u8;
+                        paint_fade_v(
+                            ui.painter(),
+                            Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
+                            Color32::from_rgba_unmultiplied(
+                                CARD_PAPER.r(),
+                                CARD_PAPER.g(),
+                                CARD_PAPER.b(),
+                                top_a,
+                            ),
+                            Color32::from_rgba_unmultiplied(
+                                CARD_PAPER.r(),
+                                CARD_PAPER.g(),
+                                CARD_PAPER.b(),
+                                mid_a,
+                            ),
+                        );
+                        paint_fade_v(
+                            ui.painter(),
+                            Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
+                            Color32::from_rgba_unmultiplied(
+                                CARD_PAPER.r(),
+                                CARD_PAPER.g(),
+                                CARD_PAPER.b(),
+                                mid_a,
+                            ),
+                            Color32::TRANSPARENT,
+                        );
+                    } else {
+                        let item = &self.library[idx - 1];
+                        let tex_opt = if is_center {
+                            item.resume_thumb.as_ref().or(item.poster_thumb.as_ref())
+                        } else {
+                            item.poster_thumb.as_ref().or(item.resume_thumb.as_ref())
+                        };
+                        if let Some(tex) = tex_opt {
+                            let fit_cr = fit_aspect_rect(cr, tex.aspect_ratio());
+                            let fit_rr = Rect::from_min_size(
+                                Pos2::new(fit_cr.left(), cr.bottom() + 2.0),
+                                Vec2::new(fit_cr.width(), ref_h),
+                            );
+                            let tint_a = ((1.0 - dim) * 120.0) as u8;
+                            ui.painter().image(
+                                tex.id(),
+                                fit_rr,
+                                Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.58)),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, tint_a),
+                            );
+                            // Real GPU blur over the floor reflection!
+                            paint_frosted(
+                                ui.painter(),
+                                &self.blur,
+                                fit_rr,
+                                [0.055, 0.055, 0.059, 0.35],
+                                1.0,
+                                false,
+                            );
+                            // Smooth 2-stage cubic fade so the bottom dissolves completely with ZERO hard edge
+                            let mid_y = rr.top() + ref_h * 0.42;
+                            paint_fade_v(
+                                ui.painter(),
+                                Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
+                                Color32::from_rgba_unmultiplied(14, 14, 15, 115),
+                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                            );
+                            paint_fade_v(
+                                ui.painter(),
+                                Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
+                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                                BG,
+                            );
+                        } else {
+                            let top_a = ((1.0 - dim) * 42.0) as u8;
                             paint_fade_v(
                                 ui.painter(),
                                 rr,
                                 Color32::from_rgba_unmultiplied(
-                                    CARD_PAPER.r(),
-                                    CARD_PAPER.g(),
-                                    CARD_PAPER.b(),
+                                    CARD_DARK.r(),
+                                    CARD_DARK.g(),
+                                    CARD_DARK.b(),
                                     top_a,
                                 ),
                                 Color32::TRANSPARENT,
                             );
-                        } else {
-                            let item = &self.library[idx - 1];
-                            let tex_opt = if is_center {
-                                item.resume_thumb.as_ref().or(item.poster_thumb.as_ref())
-                            } else {
-                                item.poster_thumb.as_ref().or(item.resume_thumb.as_ref())
-                            };
-                            if let Some(tex) = tex_opt {
-                                // Vertically flipped bottom slice of actual video frame!
-                                let tint_a = ((1.0 - dim) * 145.0 * refl_vis) as u8;
-                                ui.painter().image(
-                                    tex.id(),
-                                    rr,
-                                    Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.62)),
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, tint_a),
-                                );
-                                // Smoothly dissolve mirrored reflection into #0E0E0F floor
-                                paint_fade_v(
-                                    ui.painter(),
-                                    rr,
-                                    Color32::from_rgba_unmultiplied(14, 14, 15, 110),
-                                    BG,
-                                );
-                            } else {
-                                let top_a = ((1.0 - dim) * 55.0 * refl_vis) as u8;
-                                paint_fade_v(
-                                    ui.painter(),
-                                    rr,
-                                    Color32::from_rgba_unmultiplied(
-                                        CARD_DARK.r(),
-                                        CARD_DARK.g(),
-                                        CARD_DARK.b(),
-                                        top_a,
-                                    ),
-                                    Color32::TRANSPARENT,
-                                );
-                            }
                         }
                     }
                 }
@@ -1726,9 +1768,10 @@ impl StreamdApp {
                             }
                         }
                     } else {
-                        // Video Library Card: ZERO gray border, dual HD thumbnails (paused frame on center, poster on side peek!)
+                        // Video Library Card: aspect-locked thumbnail (ZERO stretching!) + monochrome white/gray bar
                         let item = &self.library[idx - 1];
-                        ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_DARK);
+                        ui.painter()
+                            .rect_filled(cr, CornerRadius::ZERO, Color32::BLACK);
 
                         let chosen_thumb = if is_center {
                             item.resume_thumb.as_ref().or(item.poster_thumb.as_ref())
@@ -1737,21 +1780,24 @@ impl StreamdApp {
                         };
 
                         if let Some(tex) = chosen_thumb {
+                            let img_rect = fit_aspect_rect(cr, tex.aspect_ratio());
                             ui.painter().image(
                                 tex.id(),
-                                cr,
+                                img_rect,
                                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                                 Color32::WHITE,
                             );
                             paint_fade_v(
                                 ui.painter(),
                                 Rect::from_min_size(
-                                    Pos2::new(cr.left(), cr.bottom() - cr.height() * 0.45),
-                                    Vec2::new(cr.width(), cr.height() * 0.45),
+                                    Pos2::new(cr.left(), cr.bottom() - cr.height() * 0.42),
+                                    Vec2::new(cr.width(), cr.height() * 0.42),
                                 ),
                                 Color32::TRANSPARENT,
                                 Color32::from_rgba_unmultiplied(0, 0, 0, 215),
                             );
+                        } else {
+                            ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_DARK);
                         }
 
                         if is_center {
@@ -1784,18 +1830,22 @@ impl StreamdApp {
                             Color32::from_rgba_unmultiplied(255, 255, 255, 215),
                         );
 
+                        // Monochrome white/gray hairline progress bar (matches player seekbar!)
                         let pg_r = Rect::from_min_size(
-                            Pos2::new(cr.left(), cr.bottom() - 3.0),
-                            Vec2::new(cr.width(), 3.0),
+                            Pos2::new(cr.left(), cr.bottom() - 2.5),
+                            Vec2::new(cr.width(), 2.5),
                         );
-                        ui.painter()
-                            .rect_filled(pg_r, CornerRadius::ZERO, CARD_EDGE);
+                        ui.painter().rect_filled(
+                            pg_r,
+                            CornerRadius::ZERO,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                        );
                         if item.duration > 0.0 {
                             let pct = (item.position / item.duration).clamp(0.0, 1.0) as f32;
                             ui.painter().rect_filled(
-                                Rect::from_min_size(pg_r.min, Vec2::new(pg_r.width() * pct, 3.0)),
+                                Rect::from_min_size(pg_r.min, Vec2::new(pg_r.width() * pct, 2.5)),
                                 CornerRadius::ZERO,
-                                ACCENT_BLUE,
+                                Color32::WHITE,
                             );
                         }
 
@@ -2604,7 +2654,7 @@ impl StreamdApp {
                                     want_fs_toggle = true;
                                 }
 
-                                if icon_btn(ui, Vec2::new(30.0, 28.0), draw_menu).clicked() {
+                                if icon_btn(ui, Vec2::new(30.0, 28.0), draw_gear).clicked() {
                                     if self.studio_tab.is_some() {
                                         self.studio_tab = None;
                                     } else {
@@ -2636,8 +2686,23 @@ impl StreamdApp {
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(orect), |ui| {
                         ui.set_opacity(oe);
-                        let tab_h = 36.0;
+                        let tab_h = 38.0;
                         let tab_w = ow / 3.0;
+                        let foot_h = 38.0;
+
+                        // Sliding translucent tab highlight (NO underline!)
+                        let slide_bg = Rect::from_min_size(
+                            Pos2::new(
+                                orect.left() + self.tab_slide_x * tab_w + 6.0,
+                                orect.top() + 6.0,
+                            ),
+                            Vec2::new(tab_w - 12.0, tab_h - 12.0),
+                        );
+                        ui.painter().rect_filled(
+                            slide_bg,
+                            CornerRadius::ZERO,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                        );
 
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -2652,7 +2717,7 @@ impl StreamdApp {
                                     Color32::from_rgba_unmultiplied(255, 255, 255, 115)
                                 };
                                 let b = egui::Button::new(
-                                    egui::RichText::new(label).size(12.0).color(col),
+                                    egui::RichText::new(label).size(12.5).color(col),
                                 )
                                 .fill(Color32::TRANSPARENT);
                                 if ui.add_sized(Vec2::new(tab_w, tab_h), b).clicked() {
@@ -2661,22 +2726,14 @@ impl StreamdApp {
                             }
                         });
 
-                        let slide_r = Rect::from_min_size(
-                            Pos2::new(
-                                orect.left() + self.tab_slide_x * tab_w,
-                                orect.top() + tab_h - 1.5,
-                            ),
-                            Vec2::new(tab_w, 1.5),
-                        );
-                        ui.painter()
-                            .rect_filled(slide_r, CornerRadius::ZERO, Color32::WHITE);
-
+                        // Subtle horizontal slide offset while switching tabs!
+                        let slide_off = (self.opt_tab.idx() - self.tab_slide_x) * 28.0;
                         let body_rect = Rect::from_min_size(
-                            Pos2::new(orect.left() + 14.0, orect.top() + tab_h + 10.0),
-                            Vec2::new(ow - 28.0, oh - tab_h - 20.0),
+                            Pos2::new(orect.left() + 14.0 + slide_off, orect.top() + tab_h + 8.0),
+                            Vec2::new(ow - 28.0, oh - tab_h - foot_h - 12.0),
                         );
+                        let row_w = ow - 32.0;
                         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
-                            let row_w = ow - 32.0;
                             let mpv = self.mpv.clone();
 
                             egui::ScrollArea::vertical()
@@ -2741,11 +2798,6 @@ impl StreamdApp {
                                                 if let Some(m) = &mpv {
                                                     m.set_volume(100.0);
                                                 }
-                                            }
-                                            ui.add_space(8.0);
-                                            if more_options_row(ui, row_w, "More options") {
-                                                self.studio_tab = Some(OptTab::Audio);
-                                                self.opts_open = false;
                                             }
                                         }
                                         OptTab::Subs => {
@@ -2851,11 +2903,6 @@ impl StreamdApp {
                                                 if let Some(m) = &mpv {
                                                     m.set_sub_delay(0.0);
                                                 }
-                                            }
-                                            ui.add_space(8.0);
-                                            if more_options_row(ui, row_w, "More options") {
-                                                self.studio_tab = Some(OptTab::Subs);
-                                                self.opts_open = false;
                                             }
                                         }
                                         OptTab::Video => {
@@ -3002,15 +3049,21 @@ impl StreamdApp {
                                                     }
                                                 }
                                             });
-
-                                            ui.add_space(10.0);
-                                            if more_options_row(ui, row_w, "More options") {
-                                                self.studio_tab = Some(OptTab::Video);
-                                                self.opts_open = false;
-                                            }
                                         }
                                     }
                                 });
+                        });
+
+                        // Pinned bottom "More options" row (always fixed at bottom of panel!)
+                        let foot_rect = Rect::from_min_size(
+                            Pos2::new(orect.left() + 14.0, orect.bottom() - foot_h + 2.0),
+                            Vec2::new(ow - 28.0, 30.0),
+                        );
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(foot_rect), |ui| {
+                            if more_options_row(ui, ow - 28.0, "More options") {
+                                self.studio_tab = Some(self.opt_tab);
+                                self.opts_open = false;
+                            }
                         });
                     });
                 }
