@@ -756,6 +756,7 @@ struct StreamdApp {
     last_scroll_step: Instant,
     expand_t: f32,
     morph_start: Instant,
+    player_open: bool,
     closing_morph: bool,
     morph_tex: Option<TextureHandle>,
     poster_requested_for: Option<String>,
@@ -763,8 +764,9 @@ struct StreamdApp {
     card_thumb_rx: mpsc::Receiver<(String, bool, ColorImage)>, // (source, is_poster, image)
     card_thumb_tx: mpsc::Sender<(String, bool, ColorImage)>,
 
-    // Active session & Play Next queue
+    // Active session (stays warm & paused when returning to Cover Flow; wiped on new video or app exit)
     session: Option<SessionMeta>,
+    session_source: String,
     queue: Vec<PathBuf>,
     queue_idx: usize,
     title: String,
@@ -879,6 +881,7 @@ impl StreamdApp {
             last_scroll_step: Instant::now() - Duration::from_secs(1),
             expand_t: 0.0,
             morph_start: Instant::now() - Duration::from_secs(1),
+            player_open: false,
             closing_morph: false,
             morph_tex: None,
             poster_requested_for: None,
@@ -886,6 +889,7 @@ impl StreamdApp {
             card_thumb_rx,
             card_thumb_tx,
             session: None,
+            session_source: String::new(),
             queue: Vec::new(),
             queue_idx: 0,
             title: String::new(),
@@ -950,8 +954,8 @@ impl StreamdApp {
         if self.opening || self.url.trim().is_empty() {
             return;
         }
-        let trimmed = self.url.trim();
-        let maybe_path = PathBuf::from(trimmed.strip_prefix("file://").unwrap_or(trimmed));
+        let trimmed = self.url.trim().to_string();
+        let maybe_path = PathBuf::from(trimmed.strip_prefix("file://").unwrap_or(&trimmed));
         if maybe_path.is_file() {
             self.open_local_path(maybe_path, true);
             return;
@@ -959,10 +963,11 @@ impl StreamdApp {
 
         self.opening = true;
         self.err_msg.clear();
+        self.destroy_active_session();
         self.queue.clear();
         self.queue_idx = 0;
         let req = OpenReq {
-            url: trimmed.to_string(),
+            url: trimmed,
             referer: self.referer.clone(),
             cookie: self.cookie.clone(),
             user_agent: self.user_agent.clone(),
@@ -978,6 +983,7 @@ impl StreamdApp {
 
     fn open_local_path(&mut self, path: PathBuf, discover_siblings: bool) {
         self.err_msg.clear();
+        self.destroy_active_session();
         if discover_siblings {
             let (q, idx) = sibling_videos(&path);
             self.queue = q;
@@ -1075,6 +1081,7 @@ impl StreamdApp {
         self.sub_query = t.clone();
         self.sub_results.clear();
         self.sub_msg.clear();
+        self.player_open = true;
         self.closing_morph = false;
         self.expand_t = 0.0;
         self.morph_start = Instant::now();
@@ -1085,6 +1092,7 @@ impl StreamdApp {
         } else {
             self.url.trim().to_string()
         };
+        self.session_source = source.clone();
         if !source.is_empty() {
             if let Some(pos_idx) = self.library.iter().position(|x| x.source == source) {
                 self.carousel_target = pos_idx + 1;
@@ -1110,10 +1118,34 @@ impl StreamdApp {
         }
 
         if let Some(mpv) = &self.mpv {
-            // Pass start position directly to mpv AND keep pending_resume_pos as fallback guard for HTTP streams
             mpv.load_url_at(&meta.media_url, self.pending_resume_pos);
         }
         self.session = Some(meta);
+        self.last_mouse_move = Instant::now();
+    }
+
+    /// Re-enters the already-warm paused session instantaneously (0ms reload, 0ms black flash!).
+    fn resume_warm_session(&mut self, start_over: bool) {
+        if let Some(mpv) = &self.mpv {
+            if start_over {
+                mpv.seek_absolute(0.0);
+            }
+            mpv.set_paused(false);
+        }
+        if let Some(item) = self
+            .library
+            .iter()
+            .find(|x| x.source == self.session_source)
+        {
+            self.morph_tex = item
+                .resume_thumb
+                .clone()
+                .or_else(|| item.poster_thumb.clone());
+        }
+        self.player_open = true;
+        self.closing_morph = false;
+        self.expand_t = 0.0;
+        self.morph_start = Instant::now();
         self.last_mouse_move = Instant::now();
     }
 
@@ -1121,17 +1153,12 @@ impl StreamdApp {
         if self.closing_morph {
             return;
         }
-        // Pause immediately so audio stops on frame 0 of closing
+        // Pause immediately (keep session warm in background so re-clicking resumes in 0ms!)
         if let Some(mpv) = &self.mpv {
             mpv.set_paused(true);
         }
-        // Non-blocking: kick off async exact-frame screenshot on background thread so UI has 0ms stall!
         if let Some(s) = self.session.clone() {
-            let src = if s.is_local {
-                s.media_url.clone()
-            } else {
-                self.url.trim().to_string()
-            };
+            let src = self.session_source.clone();
             if let Some(item) = self.library.iter_mut().find(|x| x.source == src) {
                 if !self.snap.media_title.is_empty() {
                     item.name = self.snap.media_title.clone();
@@ -1147,6 +1174,7 @@ impl StreamdApp {
                     .clone()
                     .or_else(|| item.poster_thumb.clone());
             }
+            let _ = s;
             self.capture_mpv_frame_async(src, ctx);
         }
         self.opts_open = false;
@@ -1155,7 +1183,18 @@ impl StreamdApp {
         self.morph_start = Instant::now();
     }
 
-    fn close_session(&mut self) {
+    fn finish_close_to_home(&mut self) {
+        // Keep session & .part alive in background while browsing Cover Flow (wiped on new video or exit)
+        self.player_open = false;
+        self.closing_morph = false;
+        self.expand_t = 0.0;
+        self.opts_open = false;
+        self.studio_tab = None;
+        self.pause_t = 0.0;
+        self.pause_since = None;
+    }
+
+    fn destroy_active_session(&mut self) {
         self.thumb_gen.fetch_add(1, Relaxed);
         if let Some(mpv) = &self.mpv {
             mpv.stop();
@@ -1165,11 +1204,11 @@ impl StreamdApp {
                 self.engine.close(&s.id);
             }
         }
+        self.session_source.clear();
+        self.player_open = false;
         self.closing_morph = false;
         self.expand_t = 0.0;
         self.pending_resume_pos = None;
-        self.queue.clear();
-        self.queue_idx = 0;
         self.thumb_cache.clear();
         self.active_thumb = None;
         self.last_thumb_bucket = -1;
@@ -1198,7 +1237,7 @@ impl StreamdApp {
         }
         if !videos.is_empty() {
             if self.session.is_some() {
-                self.close_session();
+                self.destroy_active_session();
             }
             if videos.len() > 1 {
                 self.queue = videos;
@@ -1258,7 +1297,7 @@ impl StreamdApp {
     /// Collects keyboard actions inside `ctx.input`, then dispatches viewport commands OUTSIDE
     /// to prevent egui RwLock deadlocks on macOS fullscreen toggles.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.session.is_none() || ctx.wants_keyboard_input() {
+        if !self.player_open || self.session.is_none() || ctx.wants_keyboard_input() {
             return;
         }
         let Some(mpv) = self.mpv.clone() else { return };
@@ -1941,16 +1980,21 @@ impl StreamdApp {
 
         if let Some((li, start_over)) = open_card_idx {
             if let Some(item) = self.library.get(li).cloned() {
-                self.pending_resume_pos = if !start_over && item.position > 3.0 {
-                    Some(item.position)
+                // If this exact video is already warm & paused in background, resume in 0ms!
+                if self.session.is_some() && self.session_source == item.source {
+                    self.resume_warm_session(start_over);
                 } else {
-                    None
-                };
-                if item.is_local {
-                    self.open_local_path(PathBuf::from(item.source), true);
-                } else {
-                    self.url = item.source;
-                    self.start_open_url();
+                    self.pending_resume_pos = if !start_over && item.position > 3.0 {
+                        Some(item.position)
+                    } else {
+                        None
+                    };
+                    if item.is_local {
+                        self.open_local_path(PathBuf::from(item.source), true);
+                    } else {
+                        self.url = item.source;
+                        self.start_open_url();
+                    }
                 }
             }
         }
@@ -1998,8 +2042,8 @@ impl StreamdApp {
             }
         }
 
-        // Deterministic 280ms time-based Card <-> Fullscreen morph (zero stutter!)
-        let morph_p = (self.morph_start.elapsed().as_secs_f32() / 0.28).clamp(0.0, 1.0);
+        // Deterministic 260ms time-based Card <-> Fullscreen morph
+        let morph_p = (self.morph_start.elapsed().as_secs_f32() / 0.26).clamp(0.0, 1.0);
         self.expand_t = if self.closing_morph {
             1.0 - expo_out(morph_p)
         } else {
@@ -2009,7 +2053,7 @@ impl StreamdApp {
             ctx.request_repaint();
         }
         if self.closing_morph && morph_p >= 1.0 {
-            self.close_session();
+            self.finish_close_to_home();
             return;
         }
         if self.last_status_poll.elapsed() >= Duration::from_millis(500) {
@@ -2208,8 +2252,13 @@ impl StreamdApp {
                     ),
                 );
 
-                // 1. Live GPU mpv when expanded, or aspect-locked centered morph frame during transition
-                if !self.closing_morph && exp >= 0.99 {
+                // 1. Live GPU mpv ONLY once morph is done AND mpv actually has media loaded & seeked
+                // (never flashes black or 0:00 / 0:00 while waiting for first frame!)
+                let mpv_ready = !self.closing_morph
+                    && exp >= 0.99
+                    && self.snap.duration > 0.0
+                    && self.pending_resume_pos.is_none();
+                if mpv_ready {
                     if let Some(mpv) = self.mpv.clone() {
                         let cb = egui_glow::CallbackFn::new(move |info, painter| {
                             let vp = info.viewport_in_pixels();
@@ -2225,11 +2274,8 @@ impl StreamdApp {
                         });
                     }
                 } else {
-                    ui.painter().rect_filled(
-                        video_rect,
-                        CornerRadius::ZERO,
-                        Color32::from_rgb(18, 18, 20),
-                    );
+                    ui.painter()
+                        .rect_filled(video_rect, CornerRadius::ZERO, Color32::BLACK);
                     if let Some(tex) = &self.morph_tex {
                         ui.painter().image(
                             tex.id(),
@@ -2238,6 +2284,11 @@ impl StreamdApp {
                             Color32::WHITE,
                         );
                     }
+                }
+
+                // Skip all player chrome, pause blur, HUD, and overlays until mpv is actually ready!
+                if !mpv_ready {
+                    return;
                 }
 
                 let right_cut = if self.studio_tab.is_some() {
@@ -2260,12 +2311,6 @@ impl StreamdApp {
                     } else if let Some(mpv) = &self.mpv {
                         mpv.toggle_pause();
                     }
-                }
-
-                // Skip all player chrome, pause blur, HUD, and overlays during open/close morph so
-                // nothing flashes or bleeds across the shrinking/expanding card!
-                if self.closing_morph || exp < 0.96 {
-                    return;
                 }
 
                 let p = ui.painter();
@@ -3906,7 +3951,7 @@ impl eframe::App for StreamdApp {
 
         self.handle_shortcuts(ctx);
 
-        if self.session.is_some() {
+        if self.player_open && self.session.is_some() {
             self.draw_player(ctx);
         } else {
             self.draw_home(ctx);
