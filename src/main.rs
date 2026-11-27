@@ -2070,6 +2070,7 @@ impl StreamdApp {
         }
         if self.closing_morph && morph_p >= 1.0 {
             self.finish_close_to_home();
+            self.draw_home(ctx);
             return;
         }
         if self.last_status_poll.elapsed() >= Duration::from_millis(500) {
