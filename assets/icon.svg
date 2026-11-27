@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" fill="#000000"/>
+  <!-- Sharp Play Triangle -->
+  <polygon points="134,96 416,256 134,416" fill="#FFFFFF"/>
+  <!-- Integrated Download Arrow Cutout inside Play Triangle -->
+  <rect x="210" y="182" width="24" height="86" fill="#000000"/>
+  <polygon points="178,248 222,296 266,248" fill="#000000"/>
+  <rect x="178" y="308" width="88" height="20" fill="#000000"/>
+</svg>

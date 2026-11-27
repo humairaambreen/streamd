@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows release
+        run: cargo build --release
+
+      - name: Download bundled libmpv-2.dll
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
+          $asset = $rel.assets | Where-Object { $_.name -match "^mpv-dev-x86_64-.*\.7z$" -and $_.name -notmatch "v3" } | Select-Object -First 1
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile mpv-dev.7z
+          7z x mpv-dev.7z -ompv-dev -y
+          New-Item -ItemType Directory -Force -Path dist/streamd-windows-x64 | Out-Null
+          Copy-Item target/release/streamd.exe dist/streamd-windows-x64/
+          $dll = Get-ChildItem -Path mpv-dev -Filter "libmpv-2.dll" -Recurse | Select-Object -First 1
+          Copy-Item $dll.FullName dist/streamd-windows-x64/libmpv-2.dll
+          Copy-Item README.md dist/streamd-windows-x64/
+          Compress-Archive -Path dist/streamd-windows-x64/* -DestinationPath streamd-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamd-windows-x64
+          path: streamd-windows-x64.zip
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          - os: macos-13
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install mpv & dylibbundler
+        run: brew install mpv dylibbundler
+
+      - name: Build macOS release
+        run: cargo build --release
+
+      - name: Create self-contained streamd.app bundle
+        run: |
+          APP="dist/streamd.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
+          cp target/release/streamd "$APP/Contents/MacOS/streamd"
+
+          # Generate .icns from assets/icon.png
+          mkdir -p icon.iconset
+          for sz in 16 32 128 256 512; do
+            sips -z $sz $sz assets/icon.png --out "icon.iconset/icon_${sz}x${sz}.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+
+          # Bundle libmpv and its transitive dylibs inside Contents/Frameworks
+          MPV_LIB="$(brew --prefix mpv)/lib/libmpv.2.dylib"
+          cp -L "$MPV_LIB" "$APP/Contents/Frameworks/libmpv.2.dylib"
+          chmod +w "$APP/Contents/Frameworks/libmpv.2.dylib"
+          dylibbundler -od -b \
+            -x "$APP/Contents/Frameworks/libmpv.2.dylib" \
+            -d "$APP/Contents/Frameworks" \
+            -p "@loader_path/"
+
+          cat > "$APP/Contents/Info.plist" << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>streamd</string>
+            <key>CFBundleIdentifier</key><string>com.streamd.app</string>
+            <key>CFBundleName</key><string>streamd</string>
+            <key>CFBundleVersion</key><string>0.3.0</string>
+            <key>CFBundleShortVersionString</key><string>0.3.0</string>
+            <key>CFBundleIconFile</key><string>icon.icns</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          codesign --force --deep --sign - "$APP"
+          (cd dist && zip -r "../streamd-macos-${{ matrix.arch }}.zip" streamd.app)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamd-macos-${{ matrix.arch }}
+          path: streamd-macos-${{ matrix.arch }}.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux deps & libmpv
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmpv-dev libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev pkg-config
+
+      - name: Build Linux release
+        run: cargo build --release
+
+      - name: Package Linux tarball with libmpv.so.2
+        run: |
+          mkdir -p dist/streamd-linux-x64
+          cp target/release/streamd dist/streamd-linux-x64/
+          cp -L /usr/lib/x86_64-linux-gnu/libmpv.so.2 dist/streamd-linux-x64/ || true
+          cp README.md dist/streamd-linux-x64/
+          tar -czf streamd-linux-x64.tar.gz -C dist streamd-linux-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamd-linux-x64
+          path: streamd-linux-x64.tar.gz
+
+  publish:
+    needs: [build-windows, build-macos, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*

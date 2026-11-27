@@ -1,0 +1,23 @@
+[package]
+name = "streamd"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+bytes = "1"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+flate2 = "1"
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libloading = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "default-tls", "http2", "json", "stream"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
