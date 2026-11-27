@@ -102,7 +102,10 @@ jobs:
                   <string>jpg</string><string>jpeg</string><string>png</string>
                   <string>webp</string><string>gif</string><string>bmp</string>
                   <string>tiff</string><string>heic</string><string>heif</string>
-                  <string>avif</string>
+                  <string>avif</string><string>mp3</string><string>flac</string>
+                  <string>wav</string><string>m4a</string><string>aac</string>
+                  <string>ogg</string><string>opus</string><string>aiff</string>
+                  <string>wma</string>
                 </array>
               </dict>
             </array>

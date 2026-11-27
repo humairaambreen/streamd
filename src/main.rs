@@ -12,7 +12,7 @@ use eframe::{
     },
     egui_glow,
 };
-use engine::{Engine, OnlineSub, OpenReq, SessionMeta, SessionStatus};
+use engine::{Engine, OnlineLyrics, OnlineSub, OpenReq, SessionMeta, SessionStatus};
 use mpv::{MpvPlayer, PlayerSnapshot};
 use std::{
     collections::HashMap,
@@ -189,6 +189,97 @@ fn is_sub_ext(path: &Path) -> bool {
     )
 }
 
+fn is_lrc_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("lrc")
+    )
+}
+
+fn is_audio_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "mp3"
+                | "flac"
+                | "wav"
+                | "m4a"
+                | "aac"
+                | "ogg"
+                | "opus"
+                | "wma"
+                | "alac"
+                | "aiff"
+                | "aif"
+                | "oga"
+                | "mka"
+        )
+    )
+}
+
+#[derive(Clone)]
+struct LyricLine {
+    time: Option<f64>,
+    text: String,
+}
+
+fn parse_lrc(raw: &str) -> Vec<LyricLine> {
+    let mut out = Vec::new();
+    for line in raw.replace('\r', "").lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Parse [mm:ss.xx] timestamps
+        let mut rest = trimmed;
+        let mut times = Vec::new();
+        while rest.starts_with('[') {
+            if let Some(end) = rest.find(']') {
+                let tag = &rest[1..end];
+                if let Some((m, s)) = tag.split_once(':') {
+                    if let (Ok(mm), Ok(ss)) = (m.trim().parse::<f64>(), s.trim().parse::<f64>()) {
+                        times.push(mm * 60.0 + ss);
+                    }
+                }
+                rest = rest[end + 1..].trim_start();
+            } else {
+                break;
+            }
+        }
+        if !times.is_empty() {
+            let txt = rest.trim().to_string();
+            if !txt.is_empty() {
+                for t in times {
+                    out.push(LyricLine {
+                        time: Some(t),
+                        text: txt.clone(),
+                    });
+                }
+            }
+        } else if !trimmed.starts_with('[') {
+            out.push(LyricLine {
+                time: None,
+                text: trimmed.to_string(),
+            });
+        }
+    }
+    if out.iter().any(|l| l.time.is_some()) {
+        out.sort_by(|a, b| {
+            a.time
+                .unwrap_or(0.0)
+                .partial_cmp(&b.time.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    out
+}
+
 fn is_photo_ext(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -213,10 +304,21 @@ fn is_photo_ext(path: &Path) -> bool {
     )
 }
 
-/// Decodes any photo format (JPG/PNG/WebP/GIF/BMP/TIFF natively, HEIC/HEIF/AVIF/DNG via
-/// macOS Apple ImageIO `sips` or cross-platform `ffmpeg`).
+/// Decodes any photo format safely (with content-sniffed format so misnamed PNG/JPEG never crashes,
+/// plus macOS Apple ImageIO `sips` and cross-platform `ffmpeg` fallback for HEIC/HEIF/AVIF/DNG).
 fn decode_any_photo(path: &Path, max_dim: u32) -> Option<ColorImage> {
-    let img = if let Ok(i) = image::open(path) {
+    let native = std::panic::catch_unwind(|| {
+        image::ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .decode()
+            .ok()
+    })
+    .ok()
+    .flatten();
+
+    let img = if let Some(i) = native {
         if i.width().max(i.height()) > max_dim {
             i.thumbnail(max_dim, max_dim)
         } else {
@@ -321,7 +423,7 @@ fn scan_folder_media(dir: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok().map(|x| x.path()))
-        .filter(|p| p.is_file() && (is_video_ext(p) || is_photo_ext(p)))
+        .filter(|p| p.is_file() && (is_video_ext(p) || is_photo_ext(p) || is_audio_ext(p)))
         .collect();
     list.sort_by(|a, b| {
         a.file_name()
@@ -426,6 +528,66 @@ fn paint_frosted(
             Color32::from_rgba_unmultiplied(12, 12, 14, (232.0 * alpha) as u8),
         );
     }
+}
+
+/// Paints a texture rotated by 0/90/180/270 degrees directly on GPU (0ms, zero CPU copy!).
+fn paint_rotated_image(
+    p: &egui::Painter,
+    rect: Rect,
+    tex_id: egui::TextureId,
+    rotate_deg: i64,
+    tint: Color32,
+) {
+    let uvs = match rotate_deg.rem_euclid(360) {
+        90 => [
+            Pos2::new(0.0, 1.0),
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1.0, 0.0),
+            Pos2::new(1.0, 1.0),
+        ],
+        180 => [
+            Pos2::new(1.0, 1.0),
+            Pos2::new(0.0, 1.0),
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1.0, 0.0),
+        ],
+        270 => [
+            Pos2::new(1.0, 0.0),
+            Pos2::new(1.0, 1.0),
+            Pos2::new(0.0, 1.0),
+            Pos2::new(0.0, 0.0),
+        ],
+        _ => [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1.0, 0.0),
+            Pos2::new(1.0, 1.0),
+            Pos2::new(0.0, 1.0),
+        ],
+    };
+    let mut mesh = Mesh::with_texture(tex_id);
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: rect.left_top(),
+        uv: uvs[0],
+        color: tint,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: rect.right_top(),
+        uv: uvs[1],
+        color: tint,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: rect.right_bottom(),
+        uv: uvs[2],
+        color: tint,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: rect.left_bottom(),
+        uv: uvs[3],
+        color: tint,
+    });
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    p.add(Shape::mesh(mesh));
 }
 
 // ---------- Smooth GPU vertex-interpolated fade gradients ----------
@@ -843,6 +1005,7 @@ fn labeled_bar(
 #[derive(Clone, PartialEq, Eq)]
 enum MediaKind {
     Video,
+    Audio,
     Photo,
     Folder,
 }
@@ -954,6 +1117,16 @@ struct StreamdApp {
     sub_results: Vec<OnlineSub>,
     sub_search_rx: Option<mpsc::Receiver<anyhow::Result<Vec<OnlineSub>>>>,
     sub_dl_rx: Option<mpsc::Receiver<anyhow::Result<PathBuf>>>,
+
+    // Audio mode & Live Synced Lyrics (lrclib.net + local .lrc upload)
+    is_audio_session: bool,
+    lyrics: Vec<LyricLine>,
+    lyrics_delay: f64,
+    lyrics_query: String,
+    lyrics_msg: String,
+    lyrics_results: Vec<OnlineLyrics>,
+    lyrics_rx: Option<mpsc::Receiver<anyhow::Result<Vec<OnlineLyrics>>>>,
+    lyrics_auto_fetched: bool,
 
     // Chrome, Quick Options & Full Studio Panel morphing
     last_mouse_move: Instant,
@@ -1083,6 +1256,14 @@ impl StreamdApp {
             sub_results: Vec::new(),
             sub_search_rx: None,
             sub_dl_rx: None,
+            is_audio_session: false,
+            lyrics: Vec::new(),
+            lyrics_delay: 0.0,
+            lyrics_query: String::new(),
+            lyrics_msg: String::new(),
+            lyrics_results: Vec::new(),
+            lyrics_rx: None,
+            lyrics_auto_fetched: false,
             last_mouse_move: Instant::now(),
             last_mouse_pos: None,
             chrome_t: 1.0,
@@ -1148,6 +1329,49 @@ impl StreamdApp {
         });
     }
 
+    fn spawn_audio_art(&self, source_key: String, path: String, ctx: &egui::Context) {
+        let eng = self.engine.clone();
+        let tx = self.card_thumb_tx.clone();
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(jpeg) = eng.extract_audio_art(&path) {
+                if let Ok(img) = image::load_from_memory(&jpeg) {
+                    let rgba = img.to_rgba8();
+                    let ci = ColorImage::from_rgba_unmultiplied(
+                        [rgba.width() as usize, rgba.height() as usize],
+                        rgba.as_raw(),
+                    );
+                    let _ = tx.send((source_key, true, ci));
+                    egui_ctx.request_repaint();
+                }
+            }
+        });
+    }
+
+    fn start_lyrics_search(&mut self, query: String) {
+        if query.trim().is_empty() {
+            return;
+        }
+        self.lyrics_msg = "Searching…".into();
+        let eng = self.engine.clone();
+        let (tx, rx) = mpsc::channel();
+        self.lyrics_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(eng.search_lyrics(&query));
+        });
+    }
+
+    fn load_lrc_path(&mut self, path: &Path) {
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            let parsed = parse_lrc(&txt);
+            if !parsed.is_empty() {
+                self.lyrics = parsed;
+                self.lyrics_msg = "Loaded".into();
+                self.flash("Lyrics loaded");
+            }
+        }
+    }
+
     fn add_folder(&mut self, dir: PathBuf, ctx: &egui::Context) {
         let files = scan_folder_media(&dir);
         if files.is_empty() {
@@ -1173,6 +1397,8 @@ impl StreamdApp {
             let (clean, _) = clean_title(&raw_name);
             let kind = if is_photo_ext(p) {
                 MediaKind::Photo
+            } else if is_audio_ext(p) {
+                MediaKind::Audio
             } else {
                 MediaKind::Video
             };
@@ -1187,20 +1413,26 @@ impl StreamdApp {
                 resume_thumb: None,
                 children: Vec::new(),
             });
-            // Preload thumbnails for first 12 items asynchronously
             if children.len() <= 12 {
                 if kind == MediaKind::Photo {
                     self.spawn_photo_thumb(p_str, p.clone(), 640, ctx);
+                } else if kind == MediaKind::Audio {
+                    self.spawn_audio_art(p_str.clone(), p_str, ctx);
                 } else {
                     self.spawn_card_thumb(p_str.clone(), String::new(), Some(p_str), 3, true, ctx);
                 }
             }
         }
 
-        // Also populate folder cover thumbnail from first item
         if let Some(first) = files.first() {
             if is_photo_ext(first) {
                 self.spawn_photo_thumb(folder_src.clone(), first.clone(), 640, ctx);
+            } else if is_audio_ext(first) {
+                self.spawn_audio_art(
+                    folder_src.clone(),
+                    first.to_string_lossy().into_owned(),
+                    ctx,
+                );
             } else {
                 self.spawn_card_thumb(
                     folder_src.clone(),
@@ -1501,6 +1733,16 @@ impl StreamdApp {
         self.morph_start = Instant::now();
         self.poster_requested_for = None;
 
+        let is_audio =
+            is_audio_ext(Path::new(&meta.name)) || is_audio_ext(Path::new(&meta.media_url));
+        self.is_audio_session = is_audio;
+        self.lyrics.clear();
+        self.lyrics_delay = 0.0;
+        self.lyrics_query = t.clone();
+        self.lyrics_msg.clear();
+        self.lyrics_results.clear();
+        self.lyrics_auto_fetched = false;
+
         let source = if meta.is_local {
             meta.media_url.clone()
         } else {
@@ -1517,8 +1759,12 @@ impl StreamdApp {
                     0,
                     LibraryItem {
                         name: t,
-                        source,
-                        kind: MediaKind::Video,
+                        source: source.clone(),
+                        kind: if is_audio {
+                            MediaKind::Audio
+                        } else {
+                            MediaKind::Video
+                        },
                         is_local: meta.is_local,
                         position: 0.0,
                         duration: 0.0,
@@ -1533,6 +1779,13 @@ impl StreamdApp {
             self.carousel_pos = self.carousel_target as f32;
         } else if !source.is_empty() {
             self.morph_tex = self.find_item_thumb(&source);
+        }
+        // Check for sibling .lrc file automatically when playing local audio
+        if is_audio && meta.is_local {
+            let lrc_path = Path::new(&meta.media_url).with_extension("lrc");
+            if lrc_path.is_file() {
+                self.load_lrc_path(&lrc_path);
+            }
         }
 
         if let Some(mpv) = &self.mpv {
@@ -1664,6 +1917,8 @@ impl StreamdApp {
                     self.player_open = false;
                     self.add_folder(path, ctx);
                     return;
+                } else if is_lrc_ext(&path) {
+                    self.load_lrc_path(&path);
                 } else if is_sub_ext(&path) {
                     if let Some(mpv) = &self.mpv {
                         mpv.add_sub_file(&path.to_string_lossy());
@@ -1903,6 +2158,7 @@ impl StreamdApp {
         let title = pv.title.clone();
         let tex_opt = pv.tex.clone();
         let zoom = pv.zoom;
+        let rot = pv.rotate_deg;
         let slideshow = pv.slideshow;
         let interval = pv.interval_secs;
         let mut toggle_slide = false;
@@ -1916,14 +2172,15 @@ impl StreamdApp {
                 let full_rect = ui.max_rect();
 
                 if let Some(tex) = &tex_opt {
-                    let base = fit_aspect_rect(full_rect, tex.aspect_ratio());
+                    let raw_aspect = tex.aspect_ratio();
+                    let disp_aspect = if rot.rem_euclid(180) != 0 {
+                        1.0 / raw_aspect.max(0.05)
+                    } else {
+                        raw_aspect
+                    };
+                    let base = fit_aspect_rect(full_rect, disp_aspect);
                     let img_r = Rect::from_center_size(base.center(), base.size() * zoom);
-                    ui.painter().image(
-                        tex.id(),
-                        img_r,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    paint_rotated_image(ui.painter(), img_r, tex.id(), rot, Color32::WHITE);
                 }
 
                 // Double-click toggles 1x <-> 2x zoom
@@ -2749,6 +3006,17 @@ impl StreamdApp {
                         let status_str = match item.kind {
                             MediaKind::Folder => format!("{} items", item.children.len()),
                             MediaKind::Photo => "PHOTO".into(),
+                            MediaKind::Audio => {
+                                if item.duration > 0.0 {
+                                    format!(
+                                        "{} / {}",
+                                        fmt_time_precise(item.position, item.duration),
+                                        fmt_time_precise(item.duration, item.duration)
+                                    )
+                                } else {
+                                    "AUDIO".into()
+                                }
+                            }
                             MediaKind::Video => {
                                 if item.duration > 0.0 {
                                     format!(
@@ -2929,7 +3197,7 @@ impl StreamdApp {
                 MediaKind::Photo => {
                     self.open_photo_path(PathBuf::from(item.source), start_slideshow, ctx);
                 }
-                MediaKind::Video => {
+                MediaKind::Video | MediaKind::Audio => {
                     if self.session.is_some() && self.session_source == item.source {
                         self.resume_warm_session(start_over);
                     } else {
@@ -2967,8 +3235,31 @@ impl StreamdApp {
                     self.pending_resume_pos = None;
                 }
             }
+            // Auto-extract embedded album art & auto-search synced lyrics for audio sessions!
+            if self.is_audio_session && self.snap.duration > 0.0 && !self.lyrics_auto_fetched {
+                self.lyrics_auto_fetched = true;
+                if let Some(s) = self.session.clone() {
+                    if self.find_item_thumb(&self.session_source).is_none() {
+                        let art_path = if s.is_local {
+                            s.media_url.clone()
+                        } else {
+                            s.media_url.clone()
+                        };
+                        self.spawn_audio_art(self.session_source.clone(), art_path, ctx);
+                    }
+                }
+                if self.lyrics.is_empty() {
+                    let q = if !self.snap.media_artist.is_empty() {
+                        format!("{} {}", self.title, self.snap.media_artist)
+                    } else {
+                        self.title.clone()
+                    };
+                    self.lyrics_query = q.clone();
+                    self.start_lyrics_search(q);
+                }
+            }
             // Automatically capture the 960px main poster frame (at ~15% into video) for side-peek cards!
-            if self.snap.duration > 5.0 {
+            if !self.is_audio_session && self.snap.duration > 5.0 {
                 if let Some(s) = self.session.clone() {
                     let src = if s.is_local {
                         s.media_url.clone()
@@ -3028,6 +3319,32 @@ impl StreamdApp {
                 }
             }
             self.last_status_poll = Instant::now();
+        }
+
+        if let Some(rx) = &self.lyrics_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.lyrics_rx = None;
+                match res {
+                    Ok(list) => {
+                        if let Some(first) = list.first() {
+                            if self.lyrics.is_empty() {
+                                if let Some(txt) =
+                                    first.synced.as_deref().or(first.plain.as_deref())
+                                {
+                                    self.lyrics = parse_lrc(txt);
+                                }
+                            }
+                        }
+                        self.lyrics_msg = if list.is_empty() {
+                            "No lyrics found".into()
+                        } else {
+                            String::new()
+                        };
+                        self.lyrics_results = list;
+                    }
+                    Err(e) => self.lyrics_msg = format!("Lyrics search failed: {e}"),
+                }
+            }
         }
 
         if let Some(rx) = &self.sub_search_rx {
@@ -3378,7 +3695,163 @@ impl StreamdApp {
                     && self.snap.duration > 0.0
                     && self.pending_resume_pos.is_none();
                 if mpv_ready {
-                    if let Some(mpv) = self.mpv.clone() {
+                    if self.is_audio_session {
+                        // Apple Music-style Audio Stage: Frosted album art backdrop + Cover + Live Synced Lyrics!
+                        let art_tex = self.find_item_thumb(&self.session_source);
+                        if let Some(tex) = &art_tex {
+                            let bg_r = fit_aspect_rect(full_rect, tex.aspect_ratio());
+                            let cover_scale = (full_rect.width() / bg_r.width())
+                                .max(full_rect.height() / bg_r.height())
+                                .max(1.0);
+                            let full_bg = Rect::from_center_size(
+                                full_rect.center(),
+                                bg_r.size() * cover_scale,
+                            );
+                            ui.painter().image(
+                                tex.id(),
+                                full_bg,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            paint_frosted(
+                                ui.painter(),
+                                &self.blur,
+                                full_rect,
+                                [0.04, 0.04, 0.05, 0.62],
+                                1.0,
+                                false,
+                            );
+                        } else {
+                            ui.painter().rect_filled(
+                                full_rect,
+                                CornerRadius::ZERO,
+                                Color32::from_rgb(14, 14, 16),
+                            );
+                        }
+
+                        // Left: Square Album Art + Track Title + Artist / Album
+                        let has_lyrics = !self.lyrics.is_empty();
+                        let art_size = (full_rect.height() * 0.42).clamp(180.0, 340.0);
+                        let art_cx = if has_lyrics {
+                            full_rect.left() + full_rect.width() * 0.28
+                        } else {
+                            full_rect.center().x
+                        };
+                        let art_r = Rect::from_center_size(
+                            Pos2::new(art_cx, full_rect.center().y - 34.0),
+                            Vec2::splat(art_size),
+                        );
+                        if let Some(tex) = &art_tex {
+                            ui.painter().image(
+                                tex.id(),
+                                art_r,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        } else {
+                            ui.painter().rect_filled(
+                                art_r,
+                                CornerRadius::ZERO,
+                                Color32::from_rgb(30, 30, 34),
+                            );
+                            // Minimal geometric vinyl disc mark
+                            ui.painter().circle_stroke(
+                                art_r.center(),
+                                art_size * 0.28,
+                                Stroke::new(
+                                    1.5_f32,
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 65),
+                                ),
+                            );
+                            ui.painter().circle_filled(
+                                art_r.center(),
+                                art_size * 0.06,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 110),
+                            );
+                        }
+                        let title_y = art_r.bottom() + 22.0;
+                        ui.painter().text(
+                            Pos2::new(art_cx, title_y),
+                            Align2::CENTER_CENTER,
+                            &self.title,
+                            FontId::proportional(20.0),
+                            Color32::WHITE,
+                        );
+                        if !self.snap.media_artist.is_empty() {
+                            let sub_line = if !self.snap.media_album.is_empty() {
+                                format!("{} · {}", self.snap.media_artist, self.snap.media_album)
+                            } else {
+                                self.snap.media_artist.clone()
+                            };
+                            ui.painter().text(
+                                Pos2::new(art_cx, title_y + 24.0),
+                                Align2::CENTER_CENTER,
+                                sub_line,
+                                FontId::proportional(13.5),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 155),
+                            );
+                        }
+
+                        // Right: Live Synced Lyrics (click any line to seek!)
+                        if has_lyrics {
+                            let lyr_rect = Rect::from_min_max(
+                                Pos2::new(
+                                    full_rect.left() + full_rect.width() * 0.50,
+                                    full_rect.top() + 84.0,
+                                ),
+                                Pos2::new(full_rect.right() - 48.0, full_rect.bottom() - 104.0),
+                            );
+                            let t_now = self.snap.position - self.lyrics_delay;
+                            let mut active_idx: Option<usize> = None;
+                            for (i, line) in self.lyrics.iter().enumerate() {
+                                if let Some(lt) = line.time {
+                                    if lt <= t_now {
+                                        active_idx = Some(i);
+                                    }
+                                }
+                            }
+                            let mpv_seek = self.mpv.clone();
+                            let lines_clone = self.lyrics.clone();
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(lyr_rect), |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("live_lyrics_scroll")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing = Vec2::new(0.0, 14.0);
+                                        for (i, line) in lines_clone.iter().enumerate() {
+                                            let is_active = active_idx == Some(i);
+                                            let col = if is_active {
+                                                Color32::WHITE
+                                            } else if active_idx.map_or(false, |a| i < a) {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 85)
+                                            } else {
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 130)
+                                            };
+                                            let sz = if is_active { 24.0 } else { 19.0 };
+                                            let resp = ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(&line.text)
+                                                        .size(sz)
+                                                        .color(col),
+                                                )
+                                                .wrap()
+                                                .fill(Color32::TRANSPARENT),
+                                            );
+                                            if is_active {
+                                                resp.scroll_to_me(Some(Align::Center));
+                                            }
+                                            if resp.clicked() {
+                                                if let Some(lt) = line.time {
+                                                    if let Some(m) = &mpv_seek {
+                                                        m.seek_absolute(lt + self.lyrics_delay);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                    } else if let Some(mpv) = self.mpv.clone() {
                         let cb = egui_glow::CallbackFn::new(move |info, painter| {
                             let vp = info.viewport_in_pixels();
                             let fbo = painter
@@ -3963,7 +4436,14 @@ impl StreamdApp {
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
                             for (tab, label) in [
                                 (OptTab::Audio, "Audio"),
-                                (OptTab::Subs, "Subtitles"),
+                                (
+                                    OptTab::Subs,
+                                    if self.is_audio_session {
+                                        "Lyrics"
+                                    } else {
+                                        "Subtitles"
+                                    },
+                                ),
                                 (OptTab::Video, "Video"),
                             ] {
                                 let col = if self.opt_tab == tab {
@@ -4064,99 +4544,218 @@ impl StreamdApp {
                                                 }
                                             }
                                             OptTab::Subs => {
-                                                if ui
-                                                    .add_sized(
-                                                        Vec2::new(row_w, 26.0),
-                                                        egui::Button::new(
-                                                            egui::RichText::new(
-                                                                "+ Upload Subtitle",
+                                                if self.is_audio_session {
+                                                    if ui
+                                                        .add_sized(
+                                                            Vec2::new(row_w, 26.0),
+                                                            egui::Button::new(
+                                                                egui::RichText::new(
+                                                                    "+ Upload Lyrics (.lrc)",
+                                                                )
+                                                                .size(12.0),
                                                             )
-                                                            .size(12.0),
+                                                            .fill(Color32::from_rgba_unmultiplied(
+                                                                255, 255, 255, 14,
+                                                            )),
                                                         )
-                                                        .fill(Color32::from_rgba_unmultiplied(
-                                                            255, 255, 255, 14,
-                                                        )),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    if let Some(p) = rfd::FileDialog::new()
-                                                        .add_filter(
-                                                            "Subtitles",
-                                                            &["srt", "vtt", "ass", "ssa", "sub"],
-                                                        )
-                                                        .pick_file()
+                                                        .clicked()
                                                     {
-                                                        if let Some(m) = &mpv {
-                                                            m.add_sub_file(&p.to_string_lossy());
+                                                        if let Some(p) = rfd::FileDialog::new()
+                                                            .add_filter("Lyrics", &["lrc", "txt"])
+                                                            .pick_file()
+                                                        {
+                                                            self.load_lrc_path(&p);
                                                         }
-                                                        self.flash("Subtitle loaded");
                                                     }
-                                                }
-                                                let off = self.snap.active_sid <= 0;
-                                                if ui
-                                                    .add_sized(
-                                                        Vec2::new(row_w, 24.0),
-                                                        egui::Button::new(
-                                                            egui::RichText::new("Off")
-                                                                .size(12.5)
-                                                                .color(if off {
-                                                                    Color32::WHITE
-                                                                } else {
-                                                                    Color32::from_gray(145)
-                                                                }),
+                                                    let (ld, rld) = labeled_bar(
+                                                        ui,
+                                                        row_w,
+                                                        "Lyrics Delay",
+                                                        format!("{:+.1}s", self.lyrics_delay),
+                                                        self.lyrics_delay,
+                                                        -10.0,
+                                                        10.0,
+                                                        Some(0.0),
+                                                    );
+                                                    if let Some(v) = ld {
+                                                        self.lyrics_delay =
+                                                            (v * 10.0).round() / 10.0;
+                                                    }
+                                                    if rld {
+                                                        self.lyrics_delay = 0.0;
+                                                    }
+                                                    ui.add_space(4.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing =
+                                                            Vec2::new(4.0, 0.0);
+                                                        ui.add(
+                                                            egui::TextEdit::singleline(
+                                                                &mut self.lyrics_query,
+                                                            )
+                                                            .hint_text("Search lyrics")
+                                                            .frame(false)
+                                                            .margin(Margin::symmetric(6, 5))
+                                                            .desired_width(row_w - 56.0),
+                                                        );
+                                                        if ui
+                                                            .add_sized(
+                                                                Vec2::new(48.0, 24.0),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new("Find")
+                                                                        .color(Color32::BLACK)
+                                                                        .size(12.0),
+                                                                )
+                                                                .fill(Color32::WHITE),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            let q = self.lyrics_query.clone();
+                                                            self.start_lyrics_search(q);
+                                                        }
+                                                    });
+                                                    if !self.lyrics_msg.is_empty() {
+                                                        ui.label(
+                                                            egui::RichText::new(&self.lyrics_msg)
+                                                                .size(11.5)
+                                                                .color(Color32::from_gray(145)),
+                                                        );
+                                                    }
+                                                    for item in self.lyrics_results.clone() {
+                                                        let lbl = format!(
+                                                            "{} — {}",
+                                                            item.track, item.artist
+                                                        );
+                                                        if ui
+                                                            .add_sized(
+                                                                Vec2::new(row_w, 24.0),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(
+                                                                        lbl.chars()
+                                                                            .take(34)
+                                                                            .collect::<String>(),
+                                                                    )
+                                                                    .size(11.5),
+                                                                )
+                                                                .fill(
+                                                                    Color32::from_rgba_unmultiplied(
+                                                                        255, 255, 255, 10,
+                                                                    ),
+                                                                ),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Some(txt) = item
+                                                                .synced
+                                                                .as_deref()
+                                                                .or(item.plain.as_deref())
+                                                            {
+                                                                self.lyrics = parse_lrc(txt);
+                                                                self.flash("Lyrics loaded");
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    if ui
+                                                        .add_sized(
+                                                            Vec2::new(row_w, 26.0),
+                                                            egui::Button::new(
+                                                                egui::RichText::new(
+                                                                    "+ Upload Subtitle",
+                                                                )
+                                                                .size(12.0),
+                                                            )
+                                                            .fill(Color32::from_rgba_unmultiplied(
+                                                                255, 255, 255, 14,
+                                                            )),
                                                         )
-                                                        .fill(Color32::TRANSPARENT),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_track(0);
+                                                        .clicked()
+                                                    {
+                                                        if let Some(p) = rfd::FileDialog::new()
+                                                            .add_filter(
+                                                                "Subtitles",
+                                                                &[
+                                                                    "srt", "vtt", "ass", "ssa",
+                                                                    "sub",
+                                                                ],
+                                                            )
+                                                            .pick_file()
+                                                        {
+                                                            if let Some(m) = &mpv {
+                                                                m.add_sub_file(
+                                                                    &p.to_string_lossy(),
+                                                                );
+                                                            }
+                                                            self.flash("Subtitle loaded");
+                                                        }
                                                     }
-                                                }
-                                                for tr in self.snap.sub_tracks.clone() {
-                                                    let active = tr.id == self.snap.active_sid;
+                                                    let off = self.snap.active_sid <= 0;
                                                     if ui
                                                         .add_sized(
                                                             Vec2::new(row_w, 24.0),
                                                             egui::Button::new(
-                                                                egui::RichText::new(
-                                                                    tr.display_label(),
-                                                                )
-                                                                .size(12.5)
-                                                                .color(if active {
-                                                                    Color32::WHITE
-                                                                } else {
-                                                                    Color32::from_gray(145)
-                                                                }),
+                                                                egui::RichText::new("Off")
+                                                                    .size(12.5)
+                                                                    .color(if off {
+                                                                        Color32::WHITE
+                                                                    } else {
+                                                                        Color32::from_gray(145)
+                                                                    }),
                                                             )
                                                             .fill(Color32::TRANSPARENT),
                                                         )
                                                         .clicked()
                                                     {
                                                         if let Some(m) = &mpv {
-                                                            m.set_sub_track(tr.id);
+                                                            m.set_sub_track(0);
                                                         }
                                                     }
-                                                }
-                                                ui.add_space(4.0);
-                                                let (d, rst) = labeled_bar(
-                                                    ui,
-                                                    row_w,
-                                                    "Delay",
-                                                    format!("{:+.1}s", self.snap.sub_delay),
-                                                    self.snap.sub_delay,
-                                                    -10.0,
-                                                    10.0,
-                                                    Some(0.0),
-                                                );
-                                                if let Some(nd) = d {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_delay((nd * 10.0).round() / 10.0);
+                                                    for tr in self.snap.sub_tracks.clone() {
+                                                        let active = tr.id == self.snap.active_sid;
+                                                        if ui
+                                                            .add_sized(
+                                                                Vec2::new(row_w, 24.0),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(
+                                                                        tr.display_label(),
+                                                                    )
+                                                                    .size(12.5)
+                                                                    .color(if active {
+                                                                        Color32::WHITE
+                                                                    } else {
+                                                                        Color32::from_gray(145)
+                                                                    }),
+                                                                )
+                                                                .fill(Color32::TRANSPARENT),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Some(m) = &mpv {
+                                                                m.set_sub_track(tr.id);
+                                                            }
+                                                        }
                                                     }
-                                                }
-                                                if rst {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_sub_delay(0.0);
+                                                    ui.add_space(4.0);
+                                                    let (d, rst) = labeled_bar(
+                                                        ui,
+                                                        row_w,
+                                                        "Delay",
+                                                        format!("{:+.1}s", self.snap.sub_delay),
+                                                        self.snap.sub_delay,
+                                                        -10.0,
+                                                        10.0,
+                                                        Some(0.0),
+                                                    );
+                                                    if let Some(nd) = d {
+                                                        if let Some(m) = &mpv {
+                                                            m.set_sub_delay(
+                                                                (nd * 10.0).round() / 10.0,
+                                                            );
+                                                        }
+                                                    }
+                                                    if rst {
+                                                        if let Some(m) = &mpv {
+                                                            m.set_sub_delay(0.0);
+                                                        }
                                                     }
                                                 }
                                             }

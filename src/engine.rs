@@ -67,6 +67,14 @@ pub struct OnlineSub {
     pub download_url: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct OnlineLyrics {
+    pub track: String,
+    pub artist: String,
+    pub synced: Option<String>,
+    pub plain: Option<String>,
+}
+
 struct ChunkState {
     chunks: Vec<u8>,
     urgent: VecDeque<usize>,
@@ -991,6 +999,87 @@ impl Engine {
             name,
             media_url: path.to_string_lossy().into_owned(),
             is_local: true,
+        })
+    }
+
+    /// Free, zero-API-key synced lyrics search via lrclib.net.
+    pub fn search_lyrics(&self, query: &str) -> anyhow::Result<Vec<OnlineLyrics>> {
+        let http = self.http.clone();
+        let q = query.trim().to_string();
+        self.rt.block_on(async move {
+            let arr: Vec<serde_json::Value> = http
+                .get("https://lrclib.net/api/search")
+                .query(&[("q", q)])
+                .header(
+                    H::USER_AGENT,
+                    "streamd/0.1 (https://github.com/humairaambreen/streamd)",
+                )
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let mut out: Vec<OnlineLyrics> = arr
+                .into_iter()
+                .filter_map(|v| {
+                    let synced = v["syncedLyrics"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string);
+                    let plain = v["plainLyrics"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string);
+                    if synced.is_none() && plain.is_none() {
+                        return None;
+                    }
+                    Some(OnlineLyrics {
+                        track: v["trackName"].as_str().unwrap_or("Track").to_string(),
+                        artist: v["artistName"].as_str().unwrap_or("").to_string(),
+                        synced,
+                        plain,
+                    })
+                })
+                .collect();
+            // Prefer tracks with timestamped synced lyrics first
+            out.sort_by_key(|x| if x.synced.is_some() { 0 } else { 1 });
+            out.truncate(10);
+            Ok(out)
+        })
+    }
+
+    /// Extracts embedded album cover art from an audio file (MP3/FLAC/M4A/OGG/Opus) via ffmpeg.
+    pub fn extract_audio_art(&self, path: &str) -> Option<Bytes> {
+        let p = path.to_string();
+        self.rt.block_on(async move {
+            let _permit = self.thumb_sem.acquire().await.ok()?;
+            let out = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-i",
+                    &p,
+                    "-an",
+                    "-sn",
+                    "-dn",
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale='min(iw,640)':-2",
+                    "-f",
+                    "mjpeg",
+                    "pipe:1",
+                ])
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .ok()?;
+            if out.status.success() && !out.stdout.is_empty() {
+                Some(Bytes::from(out.stdout))
+            } else {
+                None
+            }
         })
     }
 

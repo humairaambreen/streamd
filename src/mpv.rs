@@ -120,6 +120,8 @@ pub struct PlayerSnapshot {
     pub audio_delay: f64,
     pub pitch_correction: bool,
     pub media_title: String,
+    pub media_artist: String,
+    pub media_album: String,
     pub audio_tracks: Vec<TrackInfo>,
     pub sub_tracks: Vec<TrackInfo>,
     pub active_aid: i64,
@@ -487,7 +489,8 @@ impl MpvPlayer {
     }
 
     pub fn stop(&self) {
-        self.cmd_sync(&["stop"]);
+        // Must be async so libmpv never deadlocks against the active OpenGL render context on UI thread!
+        self.cmd_async(&["stop"]);
     }
 
     /// Captures the exact currently-displayed decoded video frame as a crisp JPEG in ~10ms.
@@ -879,6 +882,15 @@ impl MpvPlayer {
             pitch_correction: self.get_flag("audio-pitch-correction"),
             media_title: self
                 .get_string("metadata/by-key/title")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_default(),
+            media_artist: self
+                .get_string("metadata/by-key/artist")
+                .or_else(|| self.get_string("metadata/by-key/album_artist"))
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_default(),
+            media_album: self
+                .get_string("metadata/by-key/album")
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_default(),
             audio_tracks,
