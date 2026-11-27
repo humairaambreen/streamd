@@ -593,24 +593,26 @@ fn more_options_row(ui: &mut egui::Ui, width: f32, label: &str) -> bool {
     resp.clicked()
 }
 
-fn draw_gear(p: &egui::Painter, r: Rect, col: Color32) {
+fn draw_sliders_icon(p: &egui::Painter, r: Rect, col: Color32) {
     let c = r.center();
-    let outer = 6.2_f32;
-    let tooth = 8.0_f32;
-    let inner = 2.6_f32;
-    p.circle_stroke(c, outer - 1.2, Stroke::new(1.6_f32, col));
-    p.circle_stroke(c, inner, Stroke::new(1.2_f32, col));
-    for i in 0..8 {
-        let ang = (i as f32) * std::f32::consts::FRAC_PI_4;
-        let (s, cs) = ang.sin_cos();
-        p.line_segment(
-            [
-                Pos2::new(c.x + cs * (outer - 0.8), c.y + s * (outer - 0.8)),
-                Pos2::new(c.x + cs * tooth, c.y + s * tooth),
-            ],
-            Stroke::new(2.0_f32, col),
-        );
-    }
+    let st = Stroke::new(1.5_f32, col);
+    // Minimal 2-line Apple-style control sliders icon
+    p.line_segment(
+        [
+            Pos2::new(c.x - 6.5, c.y - 3.2),
+            Pos2::new(c.x + 6.5, c.y - 3.2),
+        ],
+        st,
+    );
+    p.circle_filled(Pos2::new(c.x - 2.0, c.y - 3.2), 2.1, col);
+    p.line_segment(
+        [
+            Pos2::new(c.x - 6.5, c.y + 3.2),
+            Pos2::new(c.x + 6.5, c.y + 3.2),
+        ],
+        st,
+    );
+    p.circle_filled(Pos2::new(c.x + 2.5, c.y + 3.2), 2.1, col);
 }
 
 // ---------- Unified headless hairline seekbar ----------
@@ -2179,56 +2181,202 @@ impl StreamdApp {
                 let cy = full_rect.center().y - 34.0;
                 let card_box = Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(card_w, card_h));
 
-                // Draw receding/returning Cover Flow side peek cards smoothly behind the morphing card!
+                // Draw the EXACT Cover Flow side cards (with full Input bar, titles, progress bars & floor reflections!)
+                // fading smoothly behind the morphing center card so there is ZERO pop when switching to draw_home!
                 let side_vis = (1.0 - exp).clamp(0.0, 1.0);
                 if side_vis > 0.01 {
+                    const BG_COL: Color32 = Color32::from_rgb(14, 14, 15);
+                    const PAPER: Color32 = Color32::from_rgb(232, 232, 227);
+                    const DARK: Color32 = Color32::from_rgb(37, 37, 40);
                     let total_cards = 1 + self.library.len();
-                    for idx in 0..total_cards {
-                        if idx == self.carousel_target {
-                            continue;
-                        }
+                    let mut s_order: Vec<usize> = (0..total_cards)
+                        .filter(|&i| i != self.carousel_target)
+                        .collect();
+                    s_order.sort_by(|&a, &b| {
+                        let da = (a as f32 - self.carousel_pos).abs();
+                        let db = (b as f32 - self.carousel_pos).abs();
+                        db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    for idx in s_order {
                         let d = idx as f32 - self.carousel_pos;
-                        if d.abs() > 2.2 {
+                        if d.abs() > 2.6 {
                             continue;
                         }
                         let ad = d.abs();
-                        let sw = (if ad <= 1.0 { 288.0 } else { 220.0 })
-                            * scale
-                            * (0.86 + 0.14 * side_vis);
-                        let sh = sw * 9.0 / 16.0;
+                        let w = if ad <= 1.0 {
+                            400.0 + (288.0 - 400.0) * ad
+                        } else {
+                            (288.0 + (220.0 - 288.0) * (ad - 1.0).min(1.0)).max(180.0)
+                        } * scale;
+                        let h = w * 9.0 / 16.0;
                         let sign = if d >= 0.0 { 1.0 } else { -1.0 };
-                        let x_off = sign
-                            * (if ad <= 1.0 { 300.0 } else { 490.0 })
-                            * scale
-                            * (1.0 + 0.15 * exp);
-                        let sr =
-                            Rect::from_center_size(Pos2::new(cx + x_off, cy), Vec2::new(sw, sh));
-                        let a = (side_vis * (1.0 - (ad * 0.4).min(0.75)) * 255.0) as u8;
+                        let x_off = if ad <= 1.0 {
+                            sign * ad * 300.0 * scale
+                        } else {
+                            sign * (300.0 + (ad - 1.0) * 190.0) * scale
+                        };
+                        let dim = if ad <= 1.0 {
+                            ad * 0.45
+                        } else {
+                            (0.45 + (ad - 1.0) * 0.25).min(0.78)
+                        };
+                        let sr = Rect::from_center_size(Pos2::new(cx + x_off, cy), Vec2::new(w, h));
+                        let vis_a = (side_vis * 255.0) as u8;
+
+                        // Soft floor reflection matching draw_home identically
+                        let ref_h = (sr.height() * 0.44).min(104.0 * scale);
+                        let rr = Rect::from_min_size(
+                            Pos2::new(sr.left(), sr.bottom() + 2.0),
+                            Vec2::new(sr.width(), ref_h),
+                        );
                         if idx == 0 {
+                            let mid_y = rr.top() + ref_h * 0.45;
+                            let top_a = ((1.0 - dim) * 58.0 * side_vis) as u8;
+                            let mid_a = ((1.0 - dim) * 14.0 * side_vis) as u8;
+                            paint_fade_v(
+                                ui.painter(),
+                                Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
+                                Color32::from_rgba_unmultiplied(
+                                    PAPER.r(),
+                                    PAPER.g(),
+                                    PAPER.b(),
+                                    top_a,
+                                ),
+                                Color32::from_rgba_unmultiplied(
+                                    PAPER.r(),
+                                    PAPER.g(),
+                                    PAPER.b(),
+                                    mid_a,
+                                ),
+                            );
+                            paint_fade_v(
+                                ui.painter(),
+                                Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
+                                Color32::from_rgba_unmultiplied(
+                                    PAPER.r(),
+                                    PAPER.g(),
+                                    PAPER.b(),
+                                    mid_a,
+                                ),
+                                Color32::TRANSPARENT,
+                            );
+
+                            // Full Card 0 with white input bar & dark '+'/'▶' button!
                             ui.painter().rect_filled(
                                 sr,
                                 CornerRadius::ZERO,
-                                Color32::from_rgba_unmultiplied(232, 232, 227, a),
+                                Color32::from_rgba_unmultiplied(
+                                    PAPER.r(),
+                                    PAPER.g(),
+                                    PAPER.b(),
+                                    vis_a,
+                                ),
+                            );
+                            let pad_x = sr.width() * 0.07;
+                            let bar_h = (46.0 * (sr.width() / (400.0 * scale))).clamp(28.0, 50.0);
+                            let bar_r = Rect::from_min_size(
+                                Pos2::new(sr.left() + pad_x, sr.center().y - bar_h * 0.5),
+                                Vec2::new(sr.width() - pad_x * 2.0, bar_h),
+                            );
+                            ui.painter().rect_filled(
+                                bar_r,
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, vis_a),
+                            );
+                            let act_r = Rect::from_min_size(
+                                Pos2::new(bar_r.right() - bar_h, bar_r.top()),
+                                Vec2::new(bar_h, bar_h),
+                            );
+                            ui.painter().rect_filled(
+                                act_r,
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(
+                                    BG_COL.r(),
+                                    BG_COL.g(),
+                                    BG_COL.b(),
+                                    vis_a,
+                                ),
+                            );
+                            ui.painter().text(
+                                Pos2::new(bar_r.left() + 12.0, bar_r.center().y),
+                                Align2::LEFT_CENTER,
+                                "Paste a link or open a file",
+                                FontId::proportional(
+                                    (13.0 * (sr.width() / (400.0 * scale))).max(10.0),
+                                ),
+                                Color32::from_rgba_unmultiplied(85, 85, 79, vis_a),
                             );
                         } else {
                             let item = &self.library[idx - 1];
-                            if let Some(tex) =
-                                item.poster_thumb.as_ref().or(item.resume_thumb.as_ref())
-                            {
+                            let tex_opt = item.poster_thumb.as_ref().or(item.resume_thumb.as_ref());
+                            if let Some(tex) = tex_opt {
+                                let fit_sr = fit_aspect_rect(sr, tex.aspect_ratio());
+                                let fit_rr = Rect::from_min_size(
+                                    Pos2::new(fit_sr.left(), sr.bottom() + 2.0),
+                                    Vec2::new(fit_sr.width(), ref_h),
+                                );
+                                let tint_a = ((1.0 - dim) * 120.0 * side_vis) as u8;
                                 ui.painter().image(
                                     tex.id(),
+                                    fit_rr,
+                                    Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.58)),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, tint_a),
+                                );
+                                let mid_y = rr.top() + ref_h * 0.42;
+                                paint_fade_v(
+                                    ui.painter(),
+                                    Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
+                                    Color32::from_rgba_unmultiplied(14, 14, 15, 115),
+                                    Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                                );
+                                paint_fade_v(
+                                    ui.painter(),
+                                    Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
+                                    Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                                    BG_COL,
+                                );
+                                ui.painter().rect_filled(
                                     sr,
+                                    CornerRadius::ZERO,
+                                    Color32::from_rgba_unmultiplied(0, 0, 0, vis_a),
+                                );
+                                ui.painter().image(
+                                    tex.id(),
+                                    fit_sr,
                                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, a),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, vis_a),
                                 );
                             } else {
                                 ui.painter().rect_filled(
                                     sr,
                                     CornerRadius::ZERO,
-                                    Color32::from_rgba_unmultiplied(37, 37, 40, a),
+                                    Color32::from_rgba_unmultiplied(
+                                        DARK.r(),
+                                        DARK.g(),
+                                        DARK.b(),
+                                        vis_a,
+                                    ),
                                 );
                             }
+                            let fs = (13.5 * (sr.width() / (400.0 * scale))).clamp(10.5, 14.5);
+                            let short_name: String = item.name.chars().take(28).collect();
+                            ui.painter().text(
+                                Pos2::new(sr.left() + 12.0, sr.bottom() - 16.0),
+                                Align2::LEFT_CENTER,
+                                short_name,
+                                FontId::proportional(fs),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, vis_a),
+                            );
                         }
+
+                        // Distance dim overlay matching draw_home identically
+                        let dim_a = ((dim * side_vis + (1.0 - side_vis)) * 255.0).min(255.0) as u8;
+                        ui.painter().rect_filled(
+                            sr,
+                            CornerRadius::ZERO,
+                            Color32::from_rgba_unmultiplied(14, 14, 15, dim_a),
+                        );
                     }
                 }
 
@@ -2622,10 +2770,17 @@ impl StreamdApp {
                             ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
                             let mpv = self.mpv.clone();
 
-                            if self.queue.len() > 1 && self.queue_idx > 0 {
-                                if icon_btn(ui, Vec2::new(28.0, 28.0), draw_prev).clicked() {
-                                    self.play_queue_offset(-1);
-                                }
+                            let has_prev = self.queue.len() > 1 && self.queue_idx > 0;
+                            let prev_resp = icon_btn(ui, Vec2::new(26.0, 28.0), |p, r, c| {
+                                let col = if has_prev {
+                                    c
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 60)
+                                };
+                                draw_prev(p, r, col);
+                            });
+                            if has_prev && prev_resp.clicked() {
+                                self.play_queue_offset(-1);
                             }
 
                             if icon_btn(ui, Vec2::new(30.0, 28.0), |p, r, c| {
@@ -2642,10 +2797,18 @@ impl StreamdApp {
                                 }
                             }
 
-                            if self.queue.len() > 1 && self.queue_idx + 1 < self.queue.len() {
-                                if icon_btn(ui, Vec2::new(28.0, 28.0), draw_next).clicked() {
-                                    self.play_queue_offset(1);
-                                }
+                            let has_next =
+                                self.queue.len() > 1 && self.queue_idx + 1 < self.queue.len();
+                            let next_resp = icon_btn(ui, Vec2::new(26.0, 28.0), |p, r, c| {
+                                let col = if has_next {
+                                    c
+                                } else {
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 60)
+                                };
+                                draw_next(p, r, col);
+                            });
+                            if has_next && next_resp.clicked() {
+                                self.play_queue_offset(1);
                             }
 
                             if ui
@@ -2710,7 +2873,8 @@ impl StreamdApp {
                                     want_fs_toggle = true;
                                 }
 
-                                if icon_btn(ui, Vec2::new(30.0, 28.0), draw_gear).clicked() {
+                                if icon_btn(ui, Vec2::new(30.0, 28.0), draw_sliders_icon).clicked()
+                                {
                                     if self.studio_tab.is_some() {
                                         self.studio_tab = None;
                                     } else {
@@ -2746,20 +2910,7 @@ impl StreamdApp {
                         let tab_w = ow / 3.0;
                         let foot_h = 38.0;
 
-                        // Sliding translucent tab highlight (NO underline!)
-                        let slide_bg = Rect::from_min_size(
-                            Pos2::new(
-                                orect.left() + self.tab_slide_x * tab_w + 6.0,
-                                orect.top() + 6.0,
-                            ),
-                            Vec2::new(tab_w - 12.0, tab_h - 12.0),
-                        );
-                        ui.painter().rect_filled(
-                            slide_bg,
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                        );
-
+                        // Pure bright-vs-dim tab headers (NO gray box, NO underline!)
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
                             for (tab, label) in [
@@ -2770,10 +2921,10 @@ impl StreamdApp {
                                 let col = if self.opt_tab == tab {
                                     Color32::WHITE
                                 } else {
-                                    Color32::from_rgba_unmultiplied(255, 255, 255, 115)
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, 105)
                                 };
                                 let b = egui::Button::new(
-                                    egui::RichText::new(label).size(12.5).color(col),
+                                    egui::RichText::new(label).size(13.0).color(col),
                                 )
                                 .fill(Color32::TRANSPARENT);
                                 if ui.add_sized(Vec2::new(tab_w, tab_h), b).clicked() {
@@ -2782,335 +2933,322 @@ impl StreamdApp {
                             }
                         });
 
-                        // Subtle horizontal slide offset while switching tabs!
-                        let slide_off = (self.opt_tab.idx() - self.tab_slide_x) * 28.0;
-                        let body_rect = Rect::from_min_size(
-                            Pos2::new(orect.left() + 14.0 + slide_off, orect.top() + tab_h + 8.0),
-                            Vec2::new(ow - 28.0, oh - tab_h - foot_h - 12.0),
+                        // True clipped horizontal sliding pager strictly INSIDE the Options panel!
+                        let body_clip = Rect::from_min_size(
+                            Pos2::new(orect.left() + 14.0, orect.top() + tab_h + 6.0),
+                            Vec2::new(ow - 28.0, oh - tab_h - foot_h - 10.0),
                         );
-                        let row_w = ow - 32.0;
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
-                            let mpv = self.mpv.clone();
+                        let page_w = body_clip.width();
+                        let row_w = page_w - 4.0;
+                        let mpv = self.mpv.clone();
 
-                            egui::ScrollArea::vertical()
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                                    match self.opt_tab {
-                                        OptTab::Audio => {
-                                            if self.snap.audio_tracks.is_empty() {
-                                                ui.label(
-                                                    egui::RichText::new("Default audio")
-                                                        .size(12.0)
-                                                        .color(Color32::from_gray(130)),
+                        for (p_idx, page_tab) in [
+                            (0.0_f32, OptTab::Audio),
+                            (1.0_f32, OptTab::Subs),
+                            (2.0_f32, OptTab::Video),
+                        ] {
+                            let dx = (p_idx - self.tab_slide_x) * (page_w + 16.0);
+                            if dx.abs() > page_w + 14.0 {
+                                continue;
+                            }
+                            let page_rect = body_clip.translate(Vec2::new(dx, 0.0));
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(page_rect), |ui| {
+                                ui.set_clip_rect(body_clip);
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("opt_page", p_idx as i32))
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                                        match page_tab {
+                                            OptTab::Audio => {
+                                                if self.snap.audio_tracks.is_empty() {
+                                                    ui.label(
+                                                        egui::RichText::new("Default audio")
+                                                            .size(12.0)
+                                                            .color(Color32::from_gray(130)),
+                                                    );
+                                                }
+                                                for tr in self.snap.audio_tracks.clone() {
+                                                    let active = tr.id == self.snap.active_aid;
+                                                    if ui
+                                                        .add_sized(
+                                                            Vec2::new(row_w, 26.0),
+                                                            egui::Button::new(
+                                                                egui::RichText::new(
+                                                                    tr.display_label(),
+                                                                )
+                                                                .size(12.5)
+                                                                .color(if active {
+                                                                    Color32::WHITE
+                                                                } else {
+                                                                    Color32::from_gray(145)
+                                                                }),
+                                                            )
+                                                            .fill(Color32::TRANSPARENT),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        if let Some(m) = &mpv {
+                                                            m.set_audio_track(tr.id);
+                                                        }
+                                                    }
+                                                }
+                                                ui.add_space(6.0);
+                                                let (v, rst) = labeled_bar(
+                                                    ui,
+                                                    row_w,
+                                                    "Boost",
+                                                    format!("{:.0}%", self.snap.volume.max(100.0)),
+                                                    self.snap.volume.max(100.0),
+                                                    100.0,
+                                                    300.0,
+                                                    None,
                                                 );
+                                                if let Some(nv) = v {
+                                                    if let Some(m) = &mpv {
+                                                        m.set_volume(nv);
+                                                    }
+                                                }
+                                                if rst {
+                                                    if let Some(m) = &mpv {
+                                                        m.set_volume(100.0);
+                                                    }
+                                                }
                                             }
-                                            for tr in self.snap.audio_tracks.clone() {
-                                                let active = tr.id == self.snap.active_aid;
+                                            OptTab::Subs => {
                                                 if ui
                                                     .add_sized(
                                                         Vec2::new(row_w, 26.0),
                                                         egui::Button::new(
-                                                            egui::RichText::new(tr.display_label())
-                                                                .size(12.0)
-                                                                .color(if active {
-                                                                    Color32::WHITE
-                                                                } else {
-                                                                    Color32::from_gray(165)
-                                                                }),
-                                                        )
-                                                        .fill(if active {
-                                                            Color32::from_rgba_unmultiplied(
-                                                                255, 255, 255, 18,
+                                                            egui::RichText::new(
+                                                                "+ Upload Subtitle",
                                                             )
-                                                        } else {
-                                                            Color32::TRANSPARENT
-                                                        }),
+                                                            .size(12.0),
+                                                        )
+                                                        .fill(Color32::from_rgba_unmultiplied(
+                                                            255, 255, 255, 14,
+                                                        )),
                                                     )
                                                     .clicked()
                                                 {
-                                                    if let Some(m) = &mpv {
-                                                        m.set_audio_track(tr.id);
-                                                    }
-                                                }
-                                            }
-                                            ui.add_space(6.0);
-                                            let (v, rst) = labeled_bar(
-                                                ui,
-                                                row_w,
-                                                "Boost",
-                                                format!("{:.0}%", self.snap.volume.max(100.0)),
-                                                self.snap.volume.max(100.0),
-                                                100.0,
-                                                300.0,
-                                                None,
-                                            );
-                                            if let Some(nv) = v {
-                                                if let Some(m) = &mpv {
-                                                    m.set_volume(nv);
-                                                }
-                                            }
-                                            if rst {
-                                                if let Some(m) = &mpv {
-                                                    m.set_volume(100.0);
-                                                }
-                                            }
-                                        }
-                                        OptTab::Subs => {
-                                            if ui
-                                                .add_sized(
-                                                    Vec2::new(row_w, 26.0),
-                                                    egui::Button::new(
-                                                        egui::RichText::new("+ Upload Subtitle")
-                                                            .size(12.0),
-                                                    )
-                                                    .fill(Color32::from_rgba_unmultiplied(
-                                                        255, 255, 255, 16,
-                                                    )),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(p) = rfd::FileDialog::new()
-                                                    .add_filter(
-                                                        "Subtitles",
-                                                        &["srt", "vtt", "ass", "ssa", "sub"],
-                                                    )
-                                                    .pick_file()
-                                                {
-                                                    if let Some(m) = &mpv {
-                                                        m.add_sub_file(&p.to_string_lossy());
-                                                    }
-                                                    self.flash("Subtitle loaded");
-                                                }
-                                            }
-                                            let off = self.snap.active_sid <= 0;
-                                            if ui
-                                                .add_sized(
-                                                    Vec2::new(row_w, 24.0),
-                                                    egui::Button::new(
-                                                        egui::RichText::new("Off")
-                                                            .size(12.0)
-                                                            .color(if off {
-                                                                Color32::WHITE
-                                                            } else {
-                                                                Color32::from_gray(165)
-                                                            }),
-                                                    )
-                                                    .fill(if off {
-                                                        Color32::from_rgba_unmultiplied(
-                                                            255, 255, 255, 18,
+                                                    if let Some(p) = rfd::FileDialog::new()
+                                                        .add_filter(
+                                                            "Subtitles",
+                                                            &["srt", "vtt", "ass", "ssa", "sub"],
                                                         )
-                                                    } else {
-                                                        Color32::TRANSPARENT
-                                                    }),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(m) = &mpv {
-                                                    m.set_sub_track(0);
+                                                        .pick_file()
+                                                    {
+                                                        if let Some(m) = &mpv {
+                                                            m.add_sub_file(&p.to_string_lossy());
+                                                        }
+                                                        self.flash("Subtitle loaded");
+                                                    }
                                                 }
-                                            }
-                                            for tr in self.snap.sub_tracks.clone() {
-                                                let active = tr.id == self.snap.active_sid;
+                                                let off = self.snap.active_sid <= 0;
                                                 if ui
                                                     .add_sized(
                                                         Vec2::new(row_w, 24.0),
                                                         egui::Button::new(
-                                                            egui::RichText::new(tr.display_label())
-                                                                .size(12.0)
-                                                                .color(if active {
+                                                            egui::RichText::new("Off")
+                                                                .size(12.5)
+                                                                .color(if off {
                                                                     Color32::WHITE
                                                                 } else {
-                                                                    Color32::from_gray(165)
+                                                                    Color32::from_gray(145)
                                                                 }),
                                                         )
-                                                        .fill(if active {
-                                                            Color32::from_rgba_unmultiplied(
-                                                                255, 255, 255, 18,
-                                                            )
-                                                        } else {
-                                                            Color32::TRANSPARENT
-                                                        }),
+                                                        .fill(Color32::TRANSPARENT),
                                                     )
                                                     .clicked()
                                                 {
                                                     if let Some(m) = &mpv {
-                                                        m.set_sub_track(tr.id);
+                                                        m.set_sub_track(0);
                                                     }
                                                 }
-                                            }
-                                            ui.add_space(4.0);
-                                            let (d, rst) = labeled_bar(
-                                                ui,
-                                                row_w,
-                                                "Delay",
-                                                format!("{:+.1}s", self.snap.sub_delay),
-                                                self.snap.sub_delay,
-                                                -10.0,
-                                                10.0,
-                                                Some(0.0),
-                                            );
-                                            if let Some(nd) = d {
-                                                if let Some(m) = &mpv {
-                                                    m.set_sub_delay((nd * 10.0).round() / 10.0);
-                                                }
-                                            }
-                                            if rst {
-                                                if let Some(m) = &mpv {
-                                                    m.set_sub_delay(0.0);
-                                                }
-                                            }
-                                        }
-                                        OptTab::Video => {
-                                            ui.label(
-                                                egui::RichText::new("Quality")
-                                                    .size(11.5)
-                                                    .color(Color32::from_gray(145)),
-                                            );
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                                                let qs = [
-                                                    (0i64, "Original"),
-                                                    (1080, "1080p"),
-                                                    (720, "720p"),
-                                                    (480, "480p"),
-                                                ];
-                                                let bw = (row_w - 12.0) / 4.0;
-                                                for (cap, lbl) in qs {
-                                                    let active = self.quality_cap == cap;
+                                                for tr in self.snap.sub_tracks.clone() {
+                                                    let active = tr.id == self.snap.active_sid;
                                                     if ui
                                                         .add_sized(
-                                                            Vec2::new(bw, 26.0),
+                                                            Vec2::new(row_w, 24.0),
                                                             egui::Button::new(
-                                                                egui::RichText::new(lbl)
-                                                                    .size(11.0)
-                                                                    .color(if active {
-                                                                        Color32::BLACK
-                                                                    } else {
-                                                                        Color32::from_gray(190)
-                                                                    }),
-                                                            )
-                                                            .fill(if active {
-                                                                Color32::WHITE
-                                                            } else {
-                                                                Color32::from_rgba_unmultiplied(
-                                                                    255, 255, 255, 14,
+                                                                egui::RichText::new(
+                                                                    tr.display_label(),
                                                                 )
-                                                            }),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        self.quality_cap = cap;
-                                                        if let Some(m) = &mpv {
-                                                            m.set_video_quality_cap(cap);
-                                                        }
-                                                        self.flash(lbl);
-                                                    }
-                                                }
-                                            });
-
-                                            ui.add_space(6.0);
-                                            ui.label(
-                                                egui::RichText::new("Playback Speed")
-                                                    .size(11.5)
-                                                    .color(Color32::from_gray(145)),
-                                            );
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                                                let bw = (row_w - 20.0) / 6.0;
-                                                for r in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
-                                                    let active = (self.snap.speed - r).abs() < 0.02;
-                                                    if ui
-                                                        .add_sized(
-                                                            Vec2::new(bw, 26.0),
-                                                            egui::Button::new(
-                                                                egui::RichText::new(format!(
-                                                                    "{r}x"
-                                                                ))
-                                                                .size(11.5)
+                                                                .size(12.5)
                                                                 .color(if active {
-                                                                    Color32::BLACK
+                                                                    Color32::WHITE
                                                                 } else {
-                                                                    Color32::from_gray(190)
+                                                                    Color32::from_gray(145)
                                                                 }),
                                                             )
-                                                            .fill(if active {
-                                                                Color32::WHITE
-                                                            } else {
-                                                                Color32::from_rgba_unmultiplied(
-                                                                    255, 255, 255, 14,
-                                                                )
-                                                            }),
+                                                            .fill(Color32::TRANSPARENT),
                                                         )
                                                         .clicked()
                                                     {
                                                         if let Some(m) = &mpv {
-                                                            m.set_speed(r);
+                                                            m.set_sub_track(tr.id);
                                                         }
-                                                        self.flash(format!("{r}x"));
                                                     }
                                                 }
-                                            });
-
-                                            ui.add_space(6.0);
-                                            ui.label(
-                                                egui::RichText::new("Aspect / Fit")
-                                                    .size(11.5)
-                                                    .color(Color32::from_gray(145)),
-                                            );
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                                                let modes = [
-                                                    ("auto", "Fit"),
-                                                    ("fill", "Fill"),
-                                                    ("16:9", "16:9"),
-                                                    ("21:9", "21:9"),
-                                                    ("stretch", "Stretch"),
-                                                ];
-                                                let bw = (row_w - 16.0) / 5.0;
-                                                for (id, lbl) in modes {
-                                                    let active = self.aspect_mode == id;
-                                                    if ui
-                                                        .add_sized(
-                                                            Vec2::new(bw, 26.0),
-                                                            egui::Button::new(
-                                                                egui::RichText::new(lbl)
-                                                                    .size(11.0)
-                                                                    .color(if active {
-                                                                        Color32::BLACK
-                                                                    } else {
-                                                                        Color32::from_gray(190)
-                                                                    }),
-                                                            )
-                                                            .fill(if active {
-                                                                Color32::WHITE
-                                                            } else {
-                                                                Color32::from_rgba_unmultiplied(
-                                                                    255, 255, 255, 14,
+                                                ui.add_space(4.0);
+                                                let (d, rst) = labeled_bar(
+                                                    ui,
+                                                    row_w,
+                                                    "Delay",
+                                                    format!("{:+.1}s", self.snap.sub_delay),
+                                                    self.snap.sub_delay,
+                                                    -10.0,
+                                                    10.0,
+                                                    Some(0.0),
+                                                );
+                                                if let Some(nd) = d {
+                                                    if let Some(m) = &mpv {
+                                                        m.set_sub_delay((nd * 10.0).round() / 10.0);
+                                                    }
+                                                }
+                                                if rst {
+                                                    if let Some(m) = &mpv {
+                                                        m.set_sub_delay(0.0);
+                                                    }
+                                                }
+                                            }
+                                            OptTab::Video => {
+                                                ui.label(
+                                                    egui::RichText::new("Quality")
+                                                        .size(11.5)
+                                                        .color(Color32::from_gray(145)),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing =
+                                                        Vec2::new(4.0, 0.0);
+                                                    let qs = [
+                                                        (0i64, "Original"),
+                                                        (1080, "1080p"),
+                                                        (720, "720p"),
+                                                        (480, "480p"),
+                                                    ];
+                                                    let bw = (row_w - 12.0) / 4.0;
+                                                    for (cap, lbl) in qs {
+                                                        let active = self.quality_cap == cap;
+                                                        if ui
+                                                            .add_sized(
+                                                                Vec2::new(bw, 26.0),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(lbl)
+                                                                        .size(11.5)
+                                                                        .color(if active {
+                                                                            Color32::WHITE
+                                                                        } else {
+                                                                            Color32::from_gray(130)
+                                                                        }),
                                                                 )
-                                                            }),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        self.aspect_mode = id.into();
-                                                        if let Some(m) = &mpv {
-                                                            if id == "fill" {
-                                                                m.set_aspect_mode("auto");
-                                                                m.set_panscan(1.0);
-                                                            } else {
-                                                                m.set_panscan(0.0);
-                                                                m.set_aspect_mode(id);
+                                                                .fill(Color32::TRANSPARENT),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.quality_cap = cap;
+                                                            if let Some(m) = &mpv {
+                                                                m.set_video_quality_cap(cap);
+                                                            }
+                                                            self.flash(lbl);
+                                                        }
+                                                    }
+                                                });
+
+                                                ui.add_space(6.0);
+                                                ui.label(
+                                                    egui::RichText::new("Playback Speed")
+                                                        .size(11.5)
+                                                        .color(Color32::from_gray(145)),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing =
+                                                        Vec2::new(4.0, 0.0);
+                                                    let bw = (row_w - 20.0) / 6.0;
+                                                    for r in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                                                        let active =
+                                                            (self.snap.speed - r).abs() < 0.02;
+                                                        if ui
+                                                            .add_sized(
+                                                                Vec2::new(bw, 26.0),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(format!(
+                                                                        "{r}x"
+                                                                    ))
+                                                                    .size(11.5)
+                                                                    .color(if active {
+                                                                        Color32::WHITE
+                                                                    } else {
+                                                                        Color32::from_gray(130)
+                                                                    }),
+                                                                )
+                                                                .fill(Color32::TRANSPARENT),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Some(m) = &mpv {
+                                                                m.set_speed(r);
+                                                            }
+                                                            self.flash(format!("{r}x"));
+                                                        }
+                                                    }
+                                                });
+
+                                                ui.add_space(6.0);
+                                                ui.label(
+                                                    egui::RichText::new("Aspect / Fit")
+                                                        .size(11.5)
+                                                        .color(Color32::from_gray(145)),
+                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing =
+                                                        Vec2::new(4.0, 0.0);
+                                                    let modes = [
+                                                        ("auto", "Fit"),
+                                                        ("fill", "Fill"),
+                                                        ("16:9", "16:9"),
+                                                        ("21:9", "21:9"),
+                                                        ("stretch", "Stretch"),
+                                                    ];
+                                                    let bw = (row_w - 16.0) / 5.0;
+                                                    for (id, lbl) in modes {
+                                                        let active = self.aspect_mode == id;
+                                                        if ui
+                                                            .add_sized(
+                                                                Vec2::new(bw, 26.0),
+                                                                egui::Button::new(
+                                                                    egui::RichText::new(lbl)
+                                                                        .size(11.5)
+                                                                        .color(if active {
+                                                                            Color32::WHITE
+                                                                        } else {
+                                                                            Color32::from_gray(130)
+                                                                        }),
+                                                                )
+                                                                .fill(Color32::TRANSPARENT),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.aspect_mode = id.into();
+                                                            if let Some(m) = &mpv {
+                                                                if id == "fill" {
+                                                                    m.set_aspect_mode("auto");
+                                                                    m.set_panscan(1.0);
+                                                                } else {
+                                                                    m.set_panscan(0.0);
+                                                                    m.set_aspect_mode(id);
+                                                                }
                                                             }
                                                         }
                                                     }
-                                                }
-                                            });
+                                                });
+                                            }
                                         }
-                                    }
-                                });
-                        });
+                                    });
+                            });
+                        }
 
-                        // Pinned bottom "More options" row (always fixed at bottom of panel!)
+                        // Pinned bottom "More options" row
                         let foot_rect = Rect::from_min_size(
                             Pos2::new(orect.left() + 14.0, orect.bottom() - foot_h + 2.0),
                             Vec2::new(ow - 28.0, 30.0),
