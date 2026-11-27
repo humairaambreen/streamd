@@ -189,6 +189,16 @@ fn is_sub_ext(path: &Path) -> bool {
     )
 }
 
+fn is_photo_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "tiff" | "tif")
+    )
+}
+
 fn is_video_ext(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -212,6 +222,29 @@ fn is_video_ext(path: &Path) -> bool {
                 | "crdownload"
         )
     )
+}
+
+fn scan_folder_media(dir: &Path) -> Vec<PathBuf> {
+    let mut list: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .filter(|p| p.is_file() && (is_video_ext(p) || is_photo_ext(p)))
+        .collect();
+    list.sort_by(|a, b| {
+        a.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .cmp(
+                &b.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+            )
+    });
+    list
 }
 
 fn sibling_videos(path: &Path) -> (Vec<PathBuf>, usize) {
@@ -716,15 +749,35 @@ fn labeled_bar(
     (changed, reset)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum MediaKind {
+    Video,
+    Photo,
+    Folder,
+}
+
 #[derive(Clone)]
 struct LibraryItem {
     name: String,
-    source: String, // URL or local path
+    source: String, // URL, local file path, or folder path
+    kind: MediaKind,
     is_local: bool,
     position: f64,
     duration: f64,
-    poster_thumb: Option<TextureHandle>, // shown when card is on side peek
+    poster_thumb: Option<TextureHandle>, // shown when card is on side peek (or folder cover)
     resume_thumb: Option<TextureHandle>, // exact paused frame shown when card is focused in center
+    children: Vec<LibraryItem>,          // isolated items when kind == MediaKind::Folder
+}
+
+struct PhotoViewer {
+    source: String,
+    title: String,
+    tex: Option<TextureHandle>,
+    zoom: f32,
+    rotate_deg: i64,
+    slideshow: bool,
+    interval_secs: f32,
+    slide_started: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -762,8 +815,11 @@ struct StreamdApp {
     open_rx: Option<mpsc::Receiver<anyhow::Result<SessionMeta>>>,
     err_msg: String,
     library: Vec<LibraryItem>,
+    active_folder: Option<usize>,
     carousel_target: usize,
     carousel_pos: f32,
+    folder_carousel_target: usize,
+    folder_carousel_pos: f32,
     scroll_accum: f32,
     last_scroll_step: Instant,
     expand_t: f32,
@@ -777,6 +833,9 @@ struct StreamdApp {
     pending_resume_pos: Option<f64>,
     card_thumb_rx: mpsc::Receiver<(String, bool, ColorImage)>, // (source, is_poster, image)
     card_thumb_tx: mpsc::Sender<(String, bool, ColorImage)>,
+    photo_viewer: Option<PhotoViewer>,
+    photo_rx: mpsc::Receiver<(String, ColorImage)>,
+    photo_tx: mpsc::Sender<(String, ColorImage)>,
 
     // Active session (stays warm & paused when returning to Cover Flow; wiped on new video or app exit)
     session: Option<SessionMeta>,
@@ -872,6 +931,7 @@ impl StreamdApp {
         let blur = cc.gl.as_ref().map(|gl| Arc::new(GpuBlur::new(gl)));
         let (thumb_tx, thumb_rx) = mpsc::channel();
         let (card_thumb_tx, card_thumb_rx) = mpsc::channel();
+        let (photo_tx, photo_rx) = mpsc::channel();
 
         let mut app = Self {
             engine,
@@ -889,8 +949,11 @@ impl StreamdApp {
             open_rx: None,
             err_msg: String::new(),
             library: Vec::new(),
+            active_folder: None,
             carousel_target: 0,
             carousel_pos: 0.0,
+            folder_carousel_target: 0,
+            folder_carousel_pos: 0.0,
             scroll_accum: 0.0,
             last_scroll_step: Instant::now() - Duration::from_secs(1),
             expand_t: 0.0,
@@ -904,6 +967,9 @@ impl StreamdApp {
             pending_resume_pos: None,
             card_thumb_rx,
             card_thumb_tx,
+            photo_viewer: None,
+            photo_rx,
+            photo_tx,
             session: None,
             session_source: String::new(),
             queue: Vec::new(),
@@ -950,8 +1016,14 @@ impl StreamdApp {
 
         if let Some(arg) = initial_arg {
             let p = PathBuf::from(arg.strip_prefix("file://").unwrap_or(&arg));
-            if p.is_file() {
-                app.open_local_path(p, true);
+            if p.is_dir() {
+                app.add_folder(p, &cc.egui_ctx);
+            } else if p.is_file() {
+                if is_photo_ext(&p) {
+                    app.open_photo_path(p, false, &cc.egui_ctx);
+                } else {
+                    app.open_local_path(p, true);
+                }
             } else if arg.starts_with("http://") || arg.starts_with("https://") {
                 app.url = arg;
                 app.start_open_url();
@@ -964,6 +1036,252 @@ impl StreamdApp {
     fn flash(&mut self, msg: impl Into<String>) {
         self.hud_text = Some(msg.into());
         self.hud_until = Instant::now() + Duration::from_millis(750);
+    }
+
+    fn spawn_photo_thumb(
+        &self,
+        source_key: String,
+        path: PathBuf,
+        max_dim: u32,
+        ctx: &egui::Context,
+    ) {
+        let tx = self.card_thumb_tx.clone();
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Ok(img) = image::open(&path) {
+                let thumb = if img.width().max(img.height()) > max_dim {
+                    img.thumbnail(max_dim, max_dim)
+                } else {
+                    img
+                };
+                let rgba = thumb.to_rgba8();
+                let ci = ColorImage::from_rgba_unmultiplied(
+                    [rgba.width() as usize, rgba.height() as usize],
+                    rgba.as_raw(),
+                );
+                let _ = tx.send((source_key, true, ci));
+                egui_ctx.request_repaint();
+            }
+        });
+    }
+
+    fn add_folder(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        let files = scan_folder_media(&dir);
+        if files.is_empty() {
+            self.err_msg = "No videos or photos found in that folder.".into();
+            return;
+        }
+        self.err_msg.clear();
+        let folder_src = dir.to_string_lossy().into_owned();
+        let folder_name = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Folder")
+            .to_string();
+
+        let mut children = Vec::with_capacity(files.len());
+        for p in &files {
+            let p_str = p.to_string_lossy().into_owned();
+            let raw_name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("item")
+                .to_string();
+            let (clean, _) = clean_title(&raw_name);
+            let kind = if is_photo_ext(p) {
+                MediaKind::Photo
+            } else {
+                MediaKind::Video
+            };
+            children.push(LibraryItem {
+                name: clean,
+                source: p_str.clone(),
+                kind: kind.clone(),
+                is_local: true,
+                position: 0.0,
+                duration: 0.0,
+                poster_thumb: None,
+                resume_thumb: None,
+                children: Vec::new(),
+            });
+            // Preload thumbnails for first 12 items asynchronously
+            if children.len() <= 12 {
+                if kind == MediaKind::Photo {
+                    self.spawn_photo_thumb(p_str, p.clone(), 640, ctx);
+                } else {
+                    self.spawn_card_thumb(p_str.clone(), String::new(), Some(p_str), 3, true, ctx);
+                }
+            }
+        }
+
+        // Also populate folder cover thumbnail from first item
+        if let Some(first) = files.first() {
+            if is_photo_ext(first) {
+                self.spawn_photo_thumb(folder_src.clone(), first.clone(), 640, ctx);
+            } else {
+                self.spawn_card_thumb(
+                    folder_src.clone(),
+                    String::new(),
+                    Some(first.to_string_lossy().into_owned()),
+                    3,
+                    true,
+                    ctx,
+                );
+            }
+        }
+
+        if let Some(pos) = self.library.iter().position(|x| x.source == folder_src) {
+            self.library[pos].children = children;
+            self.carousel_target = pos + 1;
+        } else {
+            self.library.insert(
+                0,
+                LibraryItem {
+                    name: folder_name,
+                    source: folder_src,
+                    kind: MediaKind::Folder,
+                    is_local: true,
+                    position: 0.0,
+                    duration: 0.0,
+                    poster_thumb: None,
+                    resume_thumb: None,
+                    children,
+                },
+            );
+            self.carousel_target = 1;
+        }
+        self.carousel_pos = self.carousel_target as f32;
+        // Open straight into the isolated folder Cover Flow!
+        self.active_folder = Some(self.carousel_target - 1);
+        self.folder_carousel_target = 0;
+        self.folder_carousel_pos = 0.0;
+    }
+
+    fn open_photo_path(&mut self, path: PathBuf, start_slideshow: bool, ctx: &egui::Context) {
+        self.err_msg.clear();
+        self.destroy_active_session();
+        let src = path.to_string_lossy().into_owned();
+        let raw_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Photo")
+            .to_string();
+        let (title, _) = clean_title(&raw_name);
+
+        // If not inside an isolated folder, populate queue from sibling media & add to root library
+        if self.active_folder.is_none() {
+            if let Some(parent) = path.parent() {
+                let all = scan_folder_media(parent);
+                self.queue_idx = all.iter().position(|p| p == &path).unwrap_or(0);
+                self.queue = all;
+            }
+            if !self.library.iter().any(|x| x.source == src) {
+                self.library.insert(
+                    0,
+                    LibraryItem {
+                        name: title.clone(),
+                        source: src.clone(),
+                        kind: MediaKind::Photo,
+                        is_local: true,
+                        position: 0.0,
+                        duration: 0.0,
+                        poster_thumb: None,
+                        resume_thumb: None,
+                        children: Vec::new(),
+                    },
+                );
+                self.carousel_target = 1;
+                self.carousel_pos = 1.0;
+                self.spawn_photo_thumb(src.clone(), path.clone(), 640, ctx);
+            }
+        }
+
+        // Check if we already have a cached thumbnail to display immediately while full-res decodes
+        let initial_tex = self.find_item_thumb(&src);
+        self.photo_viewer = Some(PhotoViewer {
+            source: src.clone(),
+            title,
+            tex: initial_tex,
+            zoom: 1.0,
+            rotate_deg: 0,
+            slideshow: start_slideshow,
+            interval_secs: 4.0,
+            slide_started: Instant::now(),
+        });
+        self.last_mouse_move = Instant::now();
+
+        // Decode full-resolution photo off the UI thread (zero stutter!)
+        let tx = self.photo_tx.clone();
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Ok(img) = image::open(&path) {
+                let resized = if img.width().max(img.height()) > 3840 {
+                    img.thumbnail(3840, 3840)
+                } else {
+                    img
+                };
+                let rgba = resized.to_rgba8();
+                let ci = ColorImage::from_rgba_unmultiplied(
+                    [rgba.width() as usize, rgba.height() as usize],
+                    rgba.as_raw(),
+                );
+                let _ = tx.send((src, ci));
+                egui_ctx.request_repaint();
+            }
+        });
+    }
+
+    fn find_item_thumb(&self, source: &str) -> Option<TextureHandle> {
+        for item in &self.library {
+            if item.source == source {
+                return item
+                    .resume_thumb
+                    .clone()
+                    .or_else(|| item.poster_thumb.clone());
+            }
+            for ch in &item.children {
+                if ch.source == source {
+                    return ch.resume_thumb.clone().or_else(|| ch.poster_thumb.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn step_media_queue(&mut self, delta: isize, keep_slideshow: bool, ctx: &egui::Context) {
+        if let Some(fi) = self.active_folder {
+            if let Some(folder) = self.library.get(fi) {
+                let len = folder.children.len();
+                if len == 0 {
+                    return;
+                }
+                let next = (self.folder_carousel_target as isize + delta).rem_euclid(len as isize)
+                    as usize;
+                self.folder_carousel_target = next;
+                self.folder_carousel_pos = next as f32;
+                let item = folder.children[next].clone();
+                let path = PathBuf::from(&item.source);
+                if item.kind == MediaKind::Photo {
+                    self.open_photo_path(path, keep_slideshow, ctx);
+                } else {
+                    self.photo_viewer = None;
+                    self.open_local_path(path, false);
+                }
+                return;
+            }
+        }
+        if self.queue.len() <= 1 {
+            return;
+        }
+        let next = (self.queue_idx as isize + delta).rem_euclid(self.queue.len() as isize) as usize;
+        self.queue_idx = next;
+        let path = self.queue[next].clone();
+        if is_photo_ext(&path) {
+            self.open_photo_path(path, keep_slideshow, ctx);
+        } else {
+            self.photo_viewer = None;
+            self.open_local_path(path, false);
+        }
     }
 
     fn start_open_url(&mut self) {
@@ -1116,7 +1434,7 @@ impl StreamdApp {
             self.url.trim().to_string()
         };
         self.session_source = source.clone();
-        if !source.is_empty() {
+        if !source.is_empty() && self.active_folder.is_none() {
             if let Some(pos_idx) = self.library.iter().position(|x| x.source == source) {
                 self.carousel_target = pos_idx + 1;
                 let it = &self.library[pos_idx];
@@ -1127,17 +1445,21 @@ impl StreamdApp {
                     LibraryItem {
                         name: t,
                         source,
+                        kind: MediaKind::Video,
                         is_local: meta.is_local,
                         position: 0.0,
                         duration: 0.0,
                         poster_thumb: None,
                         resume_thumb: None,
+                        children: Vec::new(),
                     },
                 );
                 self.carousel_target = 1;
                 self.morph_tex = None;
             }
             self.carousel_pos = self.carousel_target as f32;
+        } else if !source.is_empty() {
+            self.morph_tex = self.find_item_thumb(&source);
         }
 
         if let Some(mpv) = &self.mpv {
@@ -1261,19 +1583,31 @@ impl StreamdApp {
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         let mut videos = Vec::new();
+        let mut photos = Vec::new();
         for f in dropped {
             if let Some(path) = f.path {
-                if is_sub_ext(&path) {
+                if path.is_dir() {
+                    self.photo_viewer = None;
+                    self.player_open = false;
+                    self.add_folder(path, ctx);
+                    return;
+                } else if is_sub_ext(&path) {
                     if let Some(mpv) = &self.mpv {
                         mpv.add_sub_file(&path.to_string_lossy());
                         self.flash("Subtitle loaded");
                     }
+                } else if is_photo_ext(&path) {
+                    photos.push(path);
                 } else {
                     videos.push(path);
                 }
             }
         }
-        if !videos.is_empty() {
+        if !photos.is_empty() {
+            let first = photos.remove(0);
+            self.open_photo_path(first, false, ctx);
+        } else if !videos.is_empty() {
+            self.photo_viewer = None;
             if self.session.is_some() {
                 self.destroy_active_session();
             }
@@ -1434,49 +1768,347 @@ impl StreamdApp {
         }
     }
 
-    fn draw_home(&mut self, ctx: &egui::Context) {
-        let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        let total_cards = 1 + self.library.len();
-        if self.carousel_target >= total_cards {
-            self.carousel_target = total_cards.saturating_sub(1);
+    fn draw_photo_viewer(&mut self, ctx: &egui::Context) {
+        let Some(pv) = self.photo_viewer.as_mut() else {
+            return;
+        };
+
+        // Keyboard shortcuts for photo viewer & slideshow
+        let mut step_delta: isize = 0;
+        let mut close_viewer = false;
+        let mut want_fs_cmd: Option<bool> = None;
+
+        ctx.input(|i| {
+            if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::L) {
+                step_delta = 1;
+            }
+            if i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::J) {
+                step_delta = -1;
+            }
+            if i.key_pressed(Key::Space) {
+                pv.slideshow = !pv.slideshow;
+                pv.slide_started = Instant::now();
+            }
+            if i.key_pressed(Key::Escape) {
+                if self.is_fullscreen {
+                    self.is_fullscreen = false;
+                    want_fs_cmd = Some(false);
+                } else {
+                    close_viewer = true;
+                }
+            }
+            if i.key_pressed(Key::F) {
+                self.is_fullscreen = !self.is_fullscreen;
+                want_fs_cmd = Some(self.is_fullscreen);
+            }
+            if i.key_pressed(Key::R) {
+                pv.rotate_deg = (pv.rotate_deg + 90) % 360;
+            }
+            if i.raw_scroll_delta.y.abs() > 1.0 {
+                pv.zoom = (pv.zoom + i.raw_scroll_delta.y * 0.004).clamp(1.0, 3.5);
+            }
+        });
+
+        if let Some(fs) = want_fs_cmd {
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(fs));
         }
 
-        // Debounced Cover-Flow navigation: 1 trackpad swipe = exactly 1 card (never skips middle!)
-        if !ctx.wants_keyboard_input() && total_cards > 1 {
-            ctx.input(|i| {
-                if i.key_pressed(Key::ArrowRight) && self.carousel_target + 1 < total_cards {
-                    self.carousel_target += 1;
+        // Auto-advance slideshow timer
+        let slide_progress = if pv.slideshow {
+            let el = pv.slide_started.elapsed().as_secs_f32();
+            if el >= pv.interval_secs {
+                step_delta = 1;
+                1.0
+            } else {
+                ctx.request_repaint();
+                (el / pv.interval_secs).clamp(0.0, 1.0)
+            }
+        } else {
+            0.0
+        };
+
+        let title = pv.title.clone();
+        let tex_opt = pv.tex.clone();
+        let zoom = pv.zoom;
+        let slideshow = pv.slideshow;
+        let interval = pv.interval_secs;
+        let mut toggle_slide = false;
+        let mut next_interval: Option<f32> = None;
+        let mut do_rotate = false;
+        let mut toggle_zoom = false;
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(Color32::BLACK))
+            .show(ctx, |ui| {
+                let full_rect = ui.max_rect();
+
+                if let Some(tex) = &tex_opt {
+                    let base = fit_aspect_rect(full_rect, tex.aspect_ratio());
+                    let img_r = Rect::from_center_size(base.center(), base.size() * zoom);
+                    ui.painter().image(
+                        tex.id(),
+                        img_r,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
                 }
-                if i.key_pressed(Key::ArrowLeft) && self.carousel_target > 0 {
-                    self.carousel_target -= 1;
+
+                // Double-click toggles 1x <-> 2x zoom
+                let bg = ui.interact(
+                    Rect::from_min_max(
+                        Pos2::new(full_rect.left(), full_rect.top() + 56.0),
+                        Pos2::new(full_rect.right(), full_rect.bottom() - 68.0),
+                    ),
+                    egui::Id::new("photo_bg"),
+                    Sense::click(),
+                );
+                if bg.double_clicked() {
+                    toggle_zoom = true;
                 }
-                let scroll = if i.raw_scroll_delta.x.abs() > i.raw_scroll_delta.y.abs() {
-                    i.raw_scroll_delta.x
-                } else {
-                    i.raw_scroll_delta.y
-                };
-                if scroll.abs() > 0.5 {
-                    self.scroll_accum += scroll;
-                    if self.last_scroll_step.elapsed() >= Duration::from_millis(260) {
-                        if self.scroll_accum < -38.0 && self.carousel_target + 1 < total_cards {
-                            self.carousel_target += 1;
-                            self.scroll_accum = 0.0;
-                            self.last_scroll_step = Instant::now();
-                        } else if self.scroll_accum > 38.0 && self.carousel_target > 0 {
-                            self.carousel_target -= 1;
-                            self.scroll_accum = 0.0;
-                            self.last_scroll_step = Instant::now();
+
+                // Top fade + Back + Title
+                paint_fade_v(
+                    ui.painter(),
+                    Rect::from_min_size(full_rect.min, Vec2::new(full_rect.width(), 72.0)),
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 165),
+                    Color32::TRANSPARENT,
+                );
+                let top_bar = Rect::from_min_size(
+                    Pos2::new(full_rect.left() + 20.0, full_rect.top() + 14.0),
+                    Vec2::new(full_rect.width() - 40.0, 32.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(top_bar), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 0.0);
+                        if icon_btn(ui, Vec2::new(28.0, 28.0), draw_back).clicked() {
+                            close_viewer = true;
                         }
+                        ui.label(egui::RichText::new(&title).size(14.5));
+                    });
+                });
+
+                // Bottom fade + Slideshow / Prev / Next / Interval / Zoom / Fullscreen
+                paint_fade_v(
+                    ui.painter(),
+                    Rect::from_min_size(
+                        Pos2::new(full_rect.left(), full_rect.bottom() - 88.0),
+                        Vec2::new(full_rect.width(), 88.0),
+                    ),
+                    Color32::TRANSPARENT,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 195),
+                );
+
+                // Hairline slideshow countdown bar
+                if slideshow {
+                    let rail = Rect::from_min_size(
+                        Pos2::new(full_rect.left() + 22.0, full_rect.bottom() - 50.0),
+                        Vec2::new(full_rect.width() - 44.0, 2.0),
+                    );
+                    ui.painter().rect_filled(
+                        rail,
+                        CornerRadius::ZERO,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                    );
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(
+                            rail.min,
+                            Vec2::new(rail.width() * slide_progress, 2.0),
+                        ),
+                        CornerRadius::ZERO,
+                        Color32::WHITE,
+                    );
+                }
+
+                let ctrl = Rect::from_min_size(
+                    Pos2::new(full_rect.left() + 22.0, full_rect.bottom() - 38.0),
+                    Vec2::new(full_rect.width() - 44.0, 28.0),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(ctrl), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(10.0, 0.0);
+                        if icon_btn(ui, Vec2::new(26.0, 28.0), draw_prev).clicked() {
+                            step_delta = -1;
+                        }
+                        if icon_btn(ui, Vec2::new(28.0, 28.0), |p, r, c| {
+                            if slideshow {
+                                draw_pause(p, r, c);
+                            } else {
+                                draw_play(p, r, c);
+                            }
+                        })
+                        .clicked()
+                        {
+                            toggle_slide = true;
+                        }
+                        if icon_btn(ui, Vec2::new(26.0, 28.0), draw_next).clicked() {
+                            step_delta = 1;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if slideshow {
+                                        "Slideshow On"
+                                    } else {
+                                        "Slideshow"
+                                    })
+                                    .size(12.5)
+                                    .color(if slideshow {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_gray(165)
+                                    }),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            toggle_slide = true;
+                        }
+                        for secs in [3.0_f32, 5.0, 8.0] {
+                            let on = (interval - secs).abs() < 0.2;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("{}s", secs as u32))
+                                            .size(12.0)
+                                            .color(if on {
+                                                Color32::WHITE
+                                            } else {
+                                                Color32::from_gray(125)
+                                            }),
+                                    )
+                                    .fill(Color32::TRANSPARENT),
+                                )
+                                .clicked()
+                            {
+                                next_interval = Some(secs);
+                            }
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_btn(ui, Vec2::new(28.0, 28.0), |p, r, c| {
+                                draw_fullscreen(p, r, c, self.is_fullscreen);
+                            })
+                            .clicked()
+                            {
+                                self.is_fullscreen = !self.is_fullscreen;
+                                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(
+                                    self.is_fullscreen,
+                                ));
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Rotate")
+                                            .size(12.0)
+                                            .color(Color32::from_gray(175)),
+                                    )
+                                    .fill(Color32::TRANSPARENT),
+                                )
+                                .clicked()
+                            {
+                                do_rotate = true;
+                            }
+                        });
+                    });
+                });
+            });
+
+        if close_viewer {
+            self.photo_viewer = None;
+            self.home_entered_at = Instant::now();
+            return;
+        }
+        if let Some(pv) = self.photo_viewer.as_mut() {
+            if toggle_slide {
+                pv.slideshow = !pv.slideshow;
+                pv.slide_started = Instant::now();
+            }
+            if let Some(s) = next_interval {
+                pv.interval_secs = s;
+                pv.slide_started = Instant::now();
+            }
+            if toggle_zoom {
+                pv.zoom = if pv.zoom > 1.2 { 1.0 } else { 2.0 };
+            }
+            if do_rotate {
+                pv.rotate_deg = (pv.rotate_deg + 90) % 360;
+            }
+        }
+        if step_delta != 0 {
+            let keep_slide = self.photo_viewer.as_ref().map_or(false, |p| p.slideshow);
+            self.step_media_queue(step_delta, keep_slide, ctx);
+        }
+    }
+
+    fn draw_home(&mut self, ctx: &egui::Context) {
+        let dt = ctx.input(|i| i.stable_dt).min(0.05);
+        let in_folder = self.active_folder;
+        let total_cards = if let Some(fi) = in_folder {
+            self.library.get(fi).map_or(0, |f| f.children.len())
+        } else {
+            1 + self.library.len()
+        };
+
+        let (c_target, c_pos) = if in_folder.is_some() {
+            (
+                &mut self.folder_carousel_target,
+                &mut self.folder_carousel_pos,
+            )
+        } else {
+            (&mut self.carousel_target, &mut self.carousel_pos)
+        };
+        if total_cards > 0 && *c_target >= total_cards {
+            *c_target = total_cards - 1;
+        }
+
+        // Debounced Cover-Flow navigation: 1 trackpad swipe = exactly 1 card
+        let mut exit_folder = false;
+        if !ctx.wants_keyboard_input() && total_cards > 0 {
+            ctx.input(|i| {
+                if in_folder.is_some() && i.key_pressed(Key::Escape) {
+                    exit_folder = true;
+                }
+                if total_cards > 1 {
+                    if i.key_pressed(Key::ArrowRight) && *c_target + 1 < total_cards {
+                        *c_target += 1;
                     }
-                } else {
-                    self.scroll_accum *= 0.8;
+                    if i.key_pressed(Key::ArrowLeft) && *c_target > 0 {
+                        *c_target -= 1;
+                    }
+                    let scroll = if i.raw_scroll_delta.x.abs() > i.raw_scroll_delta.y.abs() {
+                        i.raw_scroll_delta.x
+                    } else {
+                        i.raw_scroll_delta.y
+                    };
+                    if scroll.abs() > 0.5 {
+                        self.scroll_accum += scroll;
+                        if self.last_scroll_step.elapsed() >= Duration::from_millis(260) {
+                            if self.scroll_accum < -38.0 && *c_target + 1 < total_cards {
+                                *c_target += 1;
+                                self.scroll_accum = 0.0;
+                                self.last_scroll_step = Instant::now();
+                            } else if self.scroll_accum > 38.0 && *c_target > 0 {
+                                *c_target -= 1;
+                                self.scroll_accum = 0.0;
+                                self.last_scroll_step = Instant::now();
+                            }
+                        }
+                    } else {
+                        self.scroll_accum *= 0.8;
+                    }
                 }
             });
         }
+        if exit_folder {
+            self.active_folder = None;
+            return;
+        }
 
-        let target_f = self.carousel_target as f32;
-        self.carousel_pos += (target_f - self.carousel_pos) * (dt * 12.0).min(1.0);
-        let target_h = if self.show_hdrs && self.carousel_target == 0 {
+        let target_f = *c_target as f32;
+        *c_pos += (target_f - *c_pos) * (dt * 12.0).min(1.0);
+        let cur_target = *c_target;
+        let cur_pos = *c_pos;
+        let target_h = if self.show_hdrs && in_folder.is_none() && cur_target == 0 {
             1.0
         } else {
             0.0
@@ -1486,20 +2118,36 @@ impl StreamdApp {
         let home_el = self.home_entered_at.elapsed().as_secs_f32();
         let center_refl_fade = smoothstep((home_el / 0.65).clamp(0.0, 1.0));
         let start_over_fade = smoothstep(((home_el - 0.22) / 0.45).clamp(0.0, 1.0));
-        if (self.carousel_pos - target_f).abs() > 0.002
+        if (cur_pos - target_f).abs() > 0.002
             || (self.hdrs_anim - target_h).abs() > 0.002
             || home_el < 0.72
         {
             ctx.request_repaint();
         }
 
-        const BG: Color32 = Color32::from_rgb(14, 14, 15); // #0E0E0F
-        const CARD_DARK: Color32 = Color32::from_rgb(37, 37, 40); // #252528
-        const CARD_PAPER: Color32 = Color32::from_rgb(232, 232, 227); // #E8E8E3
-        const ACCENT_BLUE: Color32 = Color32::from_rgb(77, 148, 255); // #4D94FF
+        const BG: Color32 = Color32::from_rgb(14, 14, 15);
+        const CARD_DARK: Color32 = Color32::from_rgb(37, 37, 40);
+        const CARD_PAPER: Color32 = Color32::from_rgb(232, 232, 227);
+        const ACCENT_BLUE: Color32 = Color32::from_rgb(77, 148, 255);
         const TEXT_MAIN: Color32 = Color32::from_rgb(232, 232, 227);
 
-        let mut open_card_idx: Option<(usize, bool)> = None; // (library_idx, start_over)
+        let mut open_item: Option<(LibraryItem, bool, bool)> = None; // (item, start_over, start_slideshow)
+        let mut enter_folder_idx: Option<usize> = None;
+        let mut pick_folder_clicked = false;
+        let mut new_target: Option<usize> = None;
+
+        // Snapshot visible items for this isolated view (either folder children or root library)
+        let items_slice: Vec<LibraryItem> = if let Some(fi) = in_folder {
+            self.library
+                .get(fi)
+                .map(|f| f.children.clone())
+                .unwrap_or_default()
+        } else {
+            self.library.clone()
+        };
+        let folder_header = in_folder
+            .and_then(|fi| self.library.get(fi))
+            .map(|f| (f.name.clone(), f.children.len()));
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
@@ -1508,6 +2156,44 @@ impl StreamdApp {
                 let cx = rect.center().x;
                 let cy = rect.center().y - 34.0;
                 let scale = (rect.width() / 960.0).clamp(0.85, 1.35);
+
+                // Folder breadcrumb bar when inside an isolated folder!
+                if let Some((fname, count)) = &folder_header {
+                    let top_r = Rect::from_min_size(
+                        Pos2::new(rect.left() + 22.0, rect.top() + 16.0),
+                        Vec2::new(rect.width() - 44.0, 32.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(top_r), |ui| {
+                        ui.horizontal(|ui| {
+                            if icon_btn(ui, Vec2::new(28.0, 28.0), draw_back).clicked() {
+                                self.active_folder = None;
+                                return;
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{fname}  ·  {count} items"))
+                                    .size(14.5)
+                                    .color(Color32::WHITE),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Slideshow")
+                                                .size(13.0)
+                                                .color(Color32::WHITE),
+                                        )
+                                        .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(it) = items_slice.get(cur_target).cloned() {
+                                        open_item = Some((it, false, true));
+                                    }
+                                }
+                            });
+                        });
+                    });
+                }
 
                 let card_geom = |d: f32| -> (Rect, f32) {
                     let ad = d.abs();
@@ -1534,26 +2220,37 @@ impl StreamdApp {
 
                 let mut order: Vec<usize> = (0..total_cards).collect();
                 order.sort_by(|&a, &b| {
-                    let da = (a as f32 - self.carousel_pos).abs();
-                    let db = (b as f32 - self.carousel_pos).abs();
+                    let da = (a as f32 - cur_pos).abs();
+                    let db = (b as f32 - cur_pos).abs();
                     db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                // 1. Real blurred mirrored floor reflections (always visible, soft cubic fade — no hard edge!)
+                let is_input_card = |idx: usize| in_folder.is_none() && idx == 0;
+                let item_for = |idx: usize| -> Option<&LibraryItem> {
+                    if in_folder.is_some() {
+                        items_slice.get(idx)
+                    } else if idx > 0 {
+                        items_slice.get(idx - 1)
+                    } else {
+                        None
+                    }
+                };
+
+                // 1. Real blurred mirrored floor reflections
                 for &idx in &order {
-                    let d = idx as f32 - self.carousel_pos;
+                    let d = idx as f32 - cur_pos;
                     if d.abs() > 2.6 {
                         continue;
                     }
                     let (cr, dim) = card_geom(d);
-                    let is_center = idx == self.carousel_target && d.abs() < 0.15;
+                    let is_center = idx == cur_target && d.abs() < 0.15;
                     let ref_h = (cr.height() * 0.44).min(104.0 * scale);
                     let rr = Rect::from_min_size(
                         Pos2::new(cr.left(), cr.bottom() + 2.0),
                         Vec2::new(cr.width(), ref_h),
                     );
 
-                    if idx == 0 {
+                    if is_input_card(idx) {
                         let mid_y = rr.top() + ref_h * 0.45;
                         let top_a = ((1.0 - dim) * 58.0) as u8;
                         let mid_a = ((1.0 - dim) * 14.0) as u8;
@@ -1584,8 +2281,7 @@ impl StreamdApp {
                             ),
                             Color32::TRANSPARENT,
                         );
-                    } else {
-                        let item = &self.library[idx - 1];
+                    } else if let Some(item) = item_for(idx) {
                         let tex_opt = if is_center {
                             item.resume_thumb.as_ref().or(item.poster_thumb.as_ref())
                         } else {
@@ -1608,7 +2304,6 @@ impl StreamdApp {
                                     Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.58)),
                                     Color32::from_rgba_unmultiplied(255, 255, 255, tint_a),
                                 );
-                                // Real GPU blur over the floor reflection!
                                 paint_frosted(
                                     ui.painter(),
                                     &self.blur,
@@ -1617,7 +2312,6 @@ impl StreamdApp {
                                     if is_center { center_refl_fade } else { 1.0 },
                                     false,
                                 );
-                                // Smooth 2-stage cubic fade so the bottom dissolves completely with ZERO hard edge
                                 let mid_y = rr.top() + ref_h * 0.42;
                                 paint_fade_v(
                                     ui.painter(),
@@ -1651,20 +2345,17 @@ impl StreamdApp {
 
                 // 2. Render Cover-Flow cards back-to-front
                 for &idx in &order {
-                    let d = idx as f32 - self.carousel_pos;
+                    let d = idx as f32 - cur_pos;
                     if d.abs() > 2.6 {
                         continue;
                     }
                     let (cr, dim) = card_geom(d);
-                    let is_center = idx == self.carousel_target && d.abs() < 0.15;
+                    let is_center = idx == cur_target && d.abs() < 0.15;
 
-                    if idx == 0 {
-                        // Card 0: Warm off-white Input Card (zero border, More options INSIDE!)
+                    if is_input_card(idx) {
                         ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_PAPER);
-
                         let pad_x = cr.width() * 0.07;
                         let bar_h = (46.0 * (cr.width() / (400.0 * scale))).clamp(28.0, 50.0);
-                        // Shift input bar up slightly inside card when More options drawer opens
                         let shift_up = if is_center {
                             expo_out(self.hdrs_anim) * (cr.height() * 0.28)
                         } else {
@@ -1727,11 +2418,14 @@ impl StreamdApp {
                                 if !self.url.trim().is_empty() {
                                     self.start_open_url();
                                 } else if let Some(p) = rfd::FileDialog::new().pick_file() {
-                                    self.open_local_path(p, true);
+                                    if is_photo_ext(&p) {
+                                        self.open_photo_path(p, false, ctx);
+                                    } else {
+                                        self.open_local_path(p, true);
+                                    }
                                 }
                             }
 
-                            // More options toggle & fields cleanly INSIDE Card 0 below the input bar!
                             let opt_area = Rect::from_min_max(
                                 Pos2::new(bar_r.left(), bar_r.bottom() + 8.0),
                                 Pos2::new(bar_r.right(), cr.bottom() - 8.0),
@@ -1739,6 +2433,7 @@ impl StreamdApp {
                             ui.scope_builder(egui::UiBuilder::new().max_rect(opt_area), |ui| {
                                 ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
                                 ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(14.0, 0.0);
                                     if ui
                                         .add(
                                             egui::Button::new(
@@ -1756,6 +2451,20 @@ impl StreamdApp {
                                         .clicked()
                                     {
                                         self.show_hdrs = !self.show_hdrs;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Open Folder")
+                                                    .size(12.5)
+                                                    .strong()
+                                                    .color(Color32::from_rgb(55, 55, 52)),
+                                            )
+                                            .fill(Color32::TRANSPARENT),
+                                        )
+                                        .clicked()
+                                    {
+                                        pick_folder_clicked = true;
                                     }
                                     if self.opening {
                                         ui.label(
@@ -1854,15 +2563,25 @@ impl StreamdApp {
                                 .interact(cr, egui::Id::new("cf_card_0"), Sense::click())
                                 .clicked()
                             {
-                                self.carousel_target = 0;
+                                new_target = Some(0);
                             }
                         }
-                    } else {
-                        // Video Library Card: aspect-locked thumbnail (ZERO stretching!) + monochrome white/gray bar
-                        let item = &self.library[idx - 1];
+                    } else if let Some(item) = item_for(idx) {
+                        // Subtle stacked edge behind Folder cards so folders are immediately distinct!
+                        if item.kind == MediaKind::Folder {
+                            let stack_r = Rect::from_min_size(
+                                Pos2::new(cr.left() + 8.0, cr.top() - 6.0),
+                                Vec2::new(cr.width() - 16.0, 6.0),
+                            );
+                            ui.painter().rect_filled(
+                                stack_r,
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+                            );
+                        }
+
                         ui.painter()
                             .rect_filled(cr, CornerRadius::ZERO, Color32::BLACK);
-
                         let chosen_thumb = if is_center {
                             item.resume_thumb.as_ref().or(item.poster_thumb.as_ref())
                         } else {
@@ -1890,7 +2609,7 @@ impl StreamdApp {
                             ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_DARK);
                         }
 
-                        if is_center && start_over_fade > 0.02 {
+                        if is_center && item.kind == MediaKind::Video && start_over_fade > 0.02 {
                             draw_play(
                                 ui.painter(),
                                 cr,
@@ -1904,14 +2623,20 @@ impl StreamdApp {
                         }
 
                         let fs = (13.5 * (cr.width() / (400.0 * scale))).clamp(10.5, 14.5);
-                        let status_str = if item.duration > 0.0 {
-                            format!(
-                                "{} / {}",
-                                fmt_time_precise(item.position, item.duration),
-                                fmt_time_precise(item.duration, item.duration)
-                            )
-                        } else {
-                            "NEW".into()
+                        let status_str = match item.kind {
+                            MediaKind::Folder => format!("{} items", item.children.len()),
+                            MediaKind::Photo => "PHOTO".into(),
+                            MediaKind::Video => {
+                                if item.duration > 0.0 {
+                                    format!(
+                                        "{} / {}",
+                                        fmt_time_precise(item.position, item.duration),
+                                        fmt_time_precise(item.duration, item.duration)
+                                    )
+                                } else {
+                                    "NEW".into()
+                                }
+                            }
                         };
                         let short_name: String = item.name.chars().take(28).collect();
                         ui.painter().text(
@@ -1929,32 +2654,40 @@ impl StreamdApp {
                             Color32::from_rgba_unmultiplied(255, 255, 255, 215),
                         );
 
-                        // Monochrome white/gray hairline progress bar (matches player seekbar!)
-                        let pg_r = Rect::from_min_size(
-                            Pos2::new(cr.left(), cr.bottom() - 2.5),
-                            Vec2::new(cr.width(), 2.5),
-                        );
-                        ui.painter().rect_filled(
-                            pg_r,
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 48),
-                        );
-                        if item.duration > 0.0 {
-                            let pct = (item.position / item.duration).clamp(0.0, 1.0) as f32;
-                            ui.painter().rect_filled(
-                                Rect::from_min_size(pg_r.min, Vec2::new(pg_r.width() * pct, 2.5)),
-                                CornerRadius::ZERO,
-                                Color32::WHITE,
+                        if item.kind == MediaKind::Video {
+                            let pg_r = Rect::from_min_size(
+                                Pos2::new(cr.left(), cr.bottom() - 2.5),
+                                Vec2::new(cr.width(), 2.5),
                             );
+                            ui.painter().rect_filled(
+                                pg_r,
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 48),
+                            );
+                            if item.duration > 0.0 {
+                                let pct = (item.position / item.duration).clamp(0.0, 1.0) as f32;
+                                ui.painter().rect_filled(
+                                    Rect::from_min_size(
+                                        pg_r.min,
+                                        Vec2::new(pg_r.width() * pct, 2.5),
+                                    ),
+                                    CornerRadius::ZERO,
+                                    Color32::WHITE,
+                                );
+                            }
                         }
 
-                        // Register card interaction FIRST, then "Start Over" on top so Start Over receives
-                        // hover & clicks cleanly without the card stealing them!
-                        let card_resp =
-                            ui.interact(cr, egui::Id::new(("cf_card", idx)), Sense::click());
-
+                        let card_resp = ui.interact(
+                            cr,
+                            egui::Id::new(("cf_card", in_folder, idx)),
+                            Sense::click(),
+                        );
                         let mut clicked_start_over = false;
-                        if is_center && item.position > 0.5 && start_over_fade > 0.02 {
+                        if is_center
+                            && item.kind == MediaKind::Video
+                            && item.position > 0.5
+                            && start_over_fade > 0.02
+                        {
                             let so_r = Rect::from_min_size(
                                 Pos2::new(cr.right() - 88.0, cr.top() + 10.0),
                                 Vec2::new(76.0, 26.0),
@@ -1989,15 +2722,19 @@ impl StreamdApp {
                             );
                             if so_resp.clicked() {
                                 clicked_start_over = true;
-                                open_card_idx = Some((idx - 1, true));
+                                open_item = Some((item.clone(), true, false));
                             }
                         }
 
                         if !clicked_start_over && card_resp.clicked() {
                             if is_center {
-                                open_card_idx = Some((idx - 1, false));
+                                if item.kind == MediaKind::Folder {
+                                    enter_folder_idx = Some(idx - 1);
+                                } else {
+                                    open_item = Some((item.clone(), false, false));
+                                }
                             } else {
-                                self.carousel_target = idx;
+                                new_target = Some(idx);
                             }
                         }
                     }
@@ -2011,14 +2748,16 @@ impl StreamdApp {
                     }
                 }
 
-                if !ctx.wants_keyboard_input()
-                    && self.carousel_target > 0
-                    && ctx.input(|i| i.key_pressed(Key::Enter))
-                {
-                    open_card_idx = Some((self.carousel_target - 1, false));
+                if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    if let Some(item) = item_for(cur_target) {
+                        if item.kind == MediaKind::Folder {
+                            enter_folder_idx = Some(cur_target - 1);
+                        } else {
+                            open_item = Some((item.clone(), false, false));
+                        }
+                    }
                 }
 
-                // Errors only (everything else lives cleanly inside the cards!)
                 if self.mpv_err.is_some() || !self.err_msg.is_empty() {
                     let foot_w = 400.0 * scale;
                     let foot_y = cy + (400.0 * scale * 9.0 / 16.0) * 0.5 + 18.0;
@@ -2045,24 +2784,46 @@ impl StreamdApp {
                 }
             });
 
-        if let Some((li, start_over)) = open_card_idx {
-            if let Some(item) = self.library.get(li).cloned() {
-                // If this exact video is already warm & paused in background, resume in 0ms!
-                if self.session.is_some() && self.session_source == item.source {
-                    self.resume_warm_session(start_over);
-                } else {
-                    self.pending_resume_pos = if !start_over && item.position > 3.0 {
-                        Some(item.position)
+        if let Some(nt) = new_target {
+            if in_folder.is_some() {
+                self.folder_carousel_target = nt;
+            } else {
+                self.carousel_target = nt;
+            }
+        }
+        if pick_folder_clicked {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.add_folder(dir, ctx);
+            }
+        }
+        if let Some(fi) = enter_folder_idx {
+            self.active_folder = Some(fi);
+            self.folder_carousel_target = 0;
+            self.folder_carousel_pos = 0.0;
+        }
+        if let Some((item, start_over, start_slideshow)) = open_item {
+            match item.kind {
+                MediaKind::Photo => {
+                    self.open_photo_path(PathBuf::from(item.source), start_slideshow, ctx);
+                }
+                MediaKind::Video => {
+                    if self.session.is_some() && self.session_source == item.source {
+                        self.resume_warm_session(start_over);
                     } else {
-                        None
-                    };
-                    if item.is_local {
-                        self.open_local_path(PathBuf::from(item.source), true);
-                    } else {
-                        self.url = item.source;
-                        self.start_open_url();
+                        self.pending_resume_pos = if !start_over && item.position > 0.5 {
+                            Some(item.position)
+                        } else {
+                            None
+                        };
+                        if item.is_local {
+                            self.open_local_path(PathBuf::from(item.source), in_folder.is_none());
+                        } else {
+                            self.url = item.source;
+                            self.start_open_url();
+                        }
                     }
                 }
+                MediaKind::Folder => {}
             }
         }
     }
@@ -4251,28 +5012,55 @@ impl StreamdApp {
 
 impl eframe::App for StreamdApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Receive decoded Cover-Flow card thumbnails (poster vs resume)
+        // Receive decoded full-res photo for PhotoViewer
+        while let Ok((src_key, ci)) = self.photo_rx.try_recv() {
+            let tex = ctx.load_texture(format!("photo_{src_key}"), ci, TextureOptions::LINEAR);
+            if let Some(pv) = self.photo_viewer.as_mut() {
+                if pv.source == src_key {
+                    pv.tex = Some(tex);
+                }
+            }
+        }
+
+        // Receive decoded Cover-Flow card thumbnails (root items AND isolated folder children!)
         while let Ok((src_key, is_poster, ci)) = self.card_thumb_rx.try_recv() {
             let tex = ctx.load_texture(
                 format!("card_{}_{}", is_poster, src_key),
                 ci,
                 TextureOptions::LINEAR,
             );
-            if let Some(item) = self.library.iter_mut().find(|x| x.source == src_key) {
-                if is_poster {
-                    item.poster_thumb = Some(tex.clone());
-                } else {
-                    item.resume_thumb = Some(tex.clone());
-                    if item.poster_thumb.is_none() {
+            let mut matched = false;
+            for item in &mut self.library {
+                if item.source == src_key {
+                    if is_poster {
                         item.poster_thumb = Some(tex.clone());
-                    }
-                    if self.pending_close_since.is_some() || self.closing_morph {
-                        self.morph_tex = Some(tex);
-                        if self.pending_close_since.take().is_some() {
-                            self.closing_morph = true;
-                            self.morph_start = Instant::now();
+                    } else {
+                        item.resume_thumb = Some(tex.clone());
+                        if item.poster_thumb.is_none() {
+                            item.poster_thumb = Some(tex.clone());
                         }
                     }
+                    matched = true;
+                }
+                for ch in &mut item.children {
+                    if ch.source == src_key {
+                        if is_poster {
+                            ch.poster_thumb = Some(tex.clone());
+                        } else {
+                            ch.resume_thumb = Some(tex.clone());
+                            if ch.poster_thumb.is_none() {
+                                ch.poster_thumb = Some(tex.clone());
+                            }
+                        }
+                        matched = true;
+                    }
+                }
+            }
+            if matched && !is_poster && (self.pending_close_since.is_some() || self.closing_morph) {
+                self.morph_tex = Some(tex);
+                if self.pending_close_since.take().is_some() {
+                    self.closing_morph = true;
+                    self.morph_start = Instant::now();
                 }
             }
         }
@@ -4294,7 +5082,9 @@ impl eframe::App for StreamdApp {
 
         self.handle_shortcuts(ctx);
 
-        if self.player_open && self.session.is_some() {
+        if self.photo_viewer.is_some() {
+            self.draw_photo_viewer(ctx);
+        } else if self.player_open && self.session.is_some() {
             self.draw_player(ctx);
         } else {
             self.draw_home(ctx);

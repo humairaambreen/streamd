@@ -99,6 +99,9 @@ jobs:
                   <string>m4v</string><string>webm</string><string>avi</string>
                   <string>ts</string><string>m2ts</string><string>flv</string>
                   <string>wmv</string><string>part</string><string>crdownload</string>
+                  <string>jpg</string><string>jpeg</string><string>png</string>
+                  <string>webp</string><string>gif</string><string>bmp</string>
+                  <string>tiff</string>
                 </array>
               </dict>
             </array>
