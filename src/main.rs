@@ -748,6 +748,7 @@ struct StreamdApp {
     last_scroll_step: Instant,
     expand_t: f32,
     morph_start: Instant,
+    home_entered_at: Instant,
     player_open: bool,
     closing_morph: bool,
     morph_tex: Option<TextureHandle>,
@@ -873,6 +874,7 @@ impl StreamdApp {
             last_scroll_step: Instant::now() - Duration::from_secs(1),
             expand_t: 0.0,
             morph_start: Instant::now() - Duration::from_secs(1),
+            home_entered_at: Instant::now() - Duration::from_secs(2),
             player_open: false,
             closing_morph: false,
             morph_tex: None,
@@ -1180,6 +1182,7 @@ impl StreamdApp {
         self.player_open = false;
         self.closing_morph = false;
         self.expand_t = 0.0;
+        self.home_entered_at = Instant::now();
         self.opts_open = false;
         self.studio_tab = None;
         self.pause_t = 0.0;
@@ -1437,7 +1440,12 @@ impl StreamdApp {
         };
         self.hdrs_anim += (target_h - self.hdrs_anim) * (dt * 14.0).min(1.0);
 
-        if (self.carousel_pos - target_f).abs() > 0.002 || (self.hdrs_anim - target_h).abs() > 0.002
+        let home_el = self.home_entered_at.elapsed().as_secs_f32();
+        let center_refl_fade = smoothstep((home_el / 0.34).clamp(0.0, 1.0));
+        let start_over_fade = smoothstep(((home_el - 0.14) / 0.28).clamp(0.0, 1.0));
+        if (self.carousel_pos - target_f).abs() > 0.002
+            || (self.hdrs_anim - target_h).abs() > 0.002
+            || home_el < 0.45
         {
             ctx.request_repaint();
         }
@@ -1546,36 +1554,41 @@ impl StreamdApp {
                                 Pos2::new(fit_cr.left(), cr.bottom() + 2.0),
                                 Vec2::new(fit_cr.width(), ref_h),
                             );
-                            let tint_a = ((1.0 - dim) * 120.0) as u8;
-                            ui.painter().image(
-                                tex.id(),
-                                fit_rr,
-                                Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.58)),
-                                Color32::from_rgba_unmultiplied(255, 255, 255, tint_a),
-                            );
-                            // Real GPU blur over the floor reflection!
-                            paint_frosted(
-                                ui.painter(),
-                                &self.blur,
-                                fit_rr,
-                                [0.055, 0.055, 0.059, 0.35],
-                                1.0,
-                                false,
-                            );
-                            // Smooth 2-stage cubic fade so the bottom dissolves completely with ZERO hard edge
-                            let mid_y = rr.top() + ref_h * 0.42;
-                            paint_fade_v(
-                                ui.painter(),
-                                Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
-                                Color32::from_rgba_unmultiplied(14, 14, 15, 115),
-                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
-                            );
-                            paint_fade_v(
-                                ui.painter(),
-                                Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
-                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
-                                BG,
-                            );
+                            let tint_a = ((1.0 - dim)
+                                * 120.0
+                                * if is_center { center_refl_fade } else { 1.0 })
+                                as u8;
+                            if tint_a > 2 {
+                                ui.painter().image(
+                                    tex.id(),
+                                    fit_rr,
+                                    Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.58)),
+                                    Color32::from_rgba_unmultiplied(255, 255, 255, tint_a),
+                                );
+                                // Real GPU blur over the floor reflection!
+                                paint_frosted(
+                                    ui.painter(),
+                                    &self.blur,
+                                    fit_rr,
+                                    [0.055, 0.055, 0.059, 0.35],
+                                    if is_center { center_refl_fade } else { 1.0 },
+                                    false,
+                                );
+                                // Smooth 2-stage cubic fade so the bottom dissolves completely with ZERO hard edge
+                                let mid_y = rr.top() + ref_h * 0.42;
+                                paint_fade_v(
+                                    ui.painter(),
+                                    Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
+                                    Color32::from_rgba_unmultiplied(14, 14, 15, 115),
+                                    Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                                );
+                                paint_fade_v(
+                                    ui.painter(),
+                                    Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
+                                    Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                                    BG,
+                                );
+                            }
                         } else {
                             let top_a = ((1.0 - dim) * 42.0) as u8;
                             paint_fade_v(
@@ -1834,11 +1847,16 @@ impl StreamdApp {
                             ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_DARK);
                         }
 
-                        if is_center {
+                        if is_center && start_over_fade > 0.02 {
                             draw_play(
                                 ui.painter(),
                                 cr,
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 230),
+                                Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    (230.0 * start_over_fade) as u8,
+                                ),
                             );
                         }
 
@@ -1883,9 +1901,9 @@ impl StreamdApp {
                             );
                         }
 
-                        // "Start Over" cleanly INSIDE the top-right corner of the focused card!
+                        // "Start Over" softly fades in after closing morph finishes!
                         let mut clicked_start_over = false;
-                        if is_center && item.position > 3.0 {
+                        if is_center && item.position > 3.0 && start_over_fade > 0.02 {
                             let so_r = Rect::from_min_size(
                                 Pos2::new(cr.right() - 92.0, cr.top() + 10.0),
                                 Vec2::new(82.0, 26.0),
@@ -1895,7 +1913,8 @@ impl StreamdApp {
                                 egui::Id::new(("cf_start_over", idx)),
                                 Sense::click(),
                             );
-                            let bg_a = if so_resp.hovered() { 185 } else { 130 };
+                            let bg_a = ((if so_resp.hovered() { 185.0 } else { 130.0 })
+                                * start_over_fade) as u8;
                             ui.painter().rect_filled(
                                 so_r,
                                 CornerRadius::ZERO,
@@ -1906,7 +1925,12 @@ impl StreamdApp {
                                 Align2::CENTER_CENTER,
                                 "Start Over",
                                 FontId::proportional(12.0),
-                                Color32::WHITE,
+                                Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    (255.0 * start_over_fade) as u8,
+                                ),
                             );
                             if so_resp.clicked() {
                                 clicked_start_over = true;
@@ -2422,8 +2446,8 @@ impl StreamdApp {
                         });
                     }
                 } else {
-                    // Interpolate outer card box + inner aspect-locked video seamlessly so title, progress bar,
-                    // and floor reflection fade smoothly into place with ZERO pop on handoff to draw_home!
+                    // Clean shrinking card during close morph (center reflection & Start Over fade in
+                    // smoothly right after the card lands in draw_home — zero sudden shadow pop!)
                     let outer_rect = Rect::from_min_max(
                         Pos2::new(
                             card_box.left() + (full_rect.left() - card_box.left()) * exp,
@@ -2436,45 +2460,6 @@ impl StreamdApp {
                     );
                     let card_chrome_a = (1.0 - exp).powi(2).clamp(0.0, 1.0);
 
-                    // Center card floor reflection fading in cleanly as card settles
-                    if card_chrome_a > 0.02 {
-                        let ref_h = (outer_rect.height() * 0.44).min(104.0 * scale);
-                        let rr = Rect::from_min_size(
-                            Pos2::new(outer_rect.left(), outer_rect.bottom() + 2.0),
-                            Vec2::new(outer_rect.width(), ref_h),
-                        );
-                        if let Some(tex) = &self.morph_tex {
-                            let fit_rr = Rect::from_min_size(
-                                Pos2::new(video_rect.left(), outer_rect.bottom() + 2.0),
-                                Vec2::new(video_rect.width(), ref_h),
-                            );
-                            ui.painter().image(
-                                tex.id(),
-                                fit_rr,
-                                Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.58)),
-                                Color32::from_rgba_unmultiplied(
-                                    255,
-                                    255,
-                                    255,
-                                    (120.0 * card_chrome_a) as u8,
-                                ),
-                            );
-                            let mid_y = rr.top() + ref_h * 0.42;
-                            paint_fade_v(
-                                ui.painter(),
-                                Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
-                                Color32::from_rgba_unmultiplied(14, 14, 15, 115),
-                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
-                            );
-                            paint_fade_v(
-                                ui.painter(),
-                                Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
-                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
-                                Color32::from_rgb(14, 14, 15),
-                            );
-                        }
-                    }
-
                     ui.painter()
                         .rect_filled(outer_rect, CornerRadius::ZERO, Color32::BLACK);
                     if let Some(tex) = &self.morph_tex {
@@ -2486,7 +2471,6 @@ impl StreamdApp {
                         );
                     }
 
-                    // Fade center card title, timestamp & white hairline progress bar smoothly in as it closes
                     if card_chrome_a > 0.02 {
                         let ca = (255.0 * card_chrome_a) as u8;
                         let fs = (13.5 * (outer_rect.width() / (400.0 * scale))).clamp(10.5, 14.5);
