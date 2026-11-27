@@ -26,6 +26,20 @@ use std::{
 
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
+fn ease_in_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+    }
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn expo_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(4)
@@ -75,24 +89,6 @@ fn setup_fonts(ctx: &egui::Context) {
             ctx.set_fonts(fonts);
             break;
         }
-    }
-}
-
-fn fmt_bytes(b: u64) -> String {
-    if b == 0 {
-        return "0 B".into();
-    }
-    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = b as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i >= 2 {
-        format!("{v:.1} {}", U[i])
-    } else {
-        format!("{v:.0} {}", U[i])
     }
 }
 
@@ -318,17 +314,11 @@ fn icon_btn(
     draw: impl FnOnce(&egui::Painter, Rect, Color32),
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::ZERO,
-            Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-        );
-    }
+    // Pure vector brightness feedback on hover (NO gray box!)
     let col = if resp.hovered() {
         Color32::WHITE
     } else {
-        Color32::from_rgba_unmultiplied(255, 255, 255, 220)
+        Color32::from_rgba_unmultiplied(255, 255, 255, 185)
     };
     draw(ui.painter(), rect, col);
     resp
@@ -2044,12 +2034,12 @@ impl StreamdApp {
             }
         }
 
-        // Deterministic 260ms time-based Card <-> Fullscreen morph
-        let morph_p = (self.morph_start.elapsed().as_secs_f32() / 0.26).clamp(0.0, 1.0);
+        // Lush 520ms cubic ease-in-out Card <-> Fullscreen morph (clearly readable Apple TV feel!)
+        let morph_p = (self.morph_start.elapsed().as_secs_f32() / 0.52).clamp(0.0, 1.0);
         self.expand_t = if self.closing_morph {
-            1.0 - expo_out(morph_p)
+            1.0 - ease_in_out_cubic(morph_p)
         } else {
-            expo_out(morph_p)
+            ease_in_out_cubic(morph_p)
         };
         if morph_p < 1.0 {
             ctx.request_repaint();
@@ -2138,9 +2128,19 @@ impl StreamdApp {
         }
         let want_pause_overlay = self
             .pause_since
-            .map_or(false, |t| t.elapsed() > Duration::from_millis(240));
+            .map_or(false, |t| t.elapsed() > Duration::from_millis(220));
         let pause_target = if want_pause_overlay { 1.0 } else { 0.0 };
-        self.pause_t += (pause_target - self.pause_t) * (dt * 9.0).min(1.0);
+        // Silky ~650ms gradual ease so pause blur melts in smoothly instead of snapping
+        let pause_rate = if pause_target > self.pause_t {
+            1.7
+        } else {
+            3.2
+        };
+        if self.pause_t < pause_target {
+            self.pause_t = (self.pause_t + dt * pause_rate).min(1.0);
+        } else if self.pause_t > pause_target {
+            self.pause_t = (self.pause_t - dt * pause_rate).max(0.0);
+        }
 
         let opts_target = if self.opts_open && self.studio_tab.is_none() {
             1.0
@@ -2422,8 +2422,61 @@ impl StreamdApp {
                         });
                     }
                 } else {
+                    // Interpolate outer card box + inner aspect-locked video seamlessly so title, progress bar,
+                    // and floor reflection fade smoothly into place with ZERO pop on handoff to draw_home!
+                    let outer_rect = Rect::from_min_max(
+                        Pos2::new(
+                            card_box.left() + (full_rect.left() - card_box.left()) * exp,
+                            card_box.top() + (full_rect.top() - card_box.top()) * exp,
+                        ),
+                        Pos2::new(
+                            card_box.right() + (full_rect.right() - card_box.right()) * exp,
+                            card_box.bottom() + (full_rect.bottom() - card_box.bottom()) * exp,
+                        ),
+                    );
+                    let card_chrome_a = (1.0 - exp).powi(2).clamp(0.0, 1.0);
+
+                    // Center card floor reflection fading in cleanly as card settles
+                    if card_chrome_a > 0.02 {
+                        let ref_h = (outer_rect.height() * 0.44).min(104.0 * scale);
+                        let rr = Rect::from_min_size(
+                            Pos2::new(outer_rect.left(), outer_rect.bottom() + 2.0),
+                            Vec2::new(outer_rect.width(), ref_h),
+                        );
+                        if let Some(tex) = &self.morph_tex {
+                            let fit_rr = Rect::from_min_size(
+                                Pos2::new(video_rect.left(), outer_rect.bottom() + 2.0),
+                                Vec2::new(video_rect.width(), ref_h),
+                            );
+                            ui.painter().image(
+                                tex.id(),
+                                fit_rr,
+                                Rect::from_min_max(Pos2::new(0.0, 1.0), Pos2::new(1.0, 0.58)),
+                                Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    (120.0 * card_chrome_a) as u8,
+                                ),
+                            );
+                            let mid_y = rr.top() + ref_h * 0.42;
+                            paint_fade_v(
+                                ui.painter(),
+                                Rect::from_min_max(rr.min, Pos2::new(rr.right(), mid_y)),
+                                Color32::from_rgba_unmultiplied(14, 14, 15, 115),
+                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                            );
+                            paint_fade_v(
+                                ui.painter(),
+                                Rect::from_min_max(Pos2::new(rr.left(), mid_y), rr.max),
+                                Color32::from_rgba_unmultiplied(14, 14, 15, 228),
+                                Color32::from_rgb(14, 14, 15),
+                            );
+                        }
+                    }
+
                     ui.painter()
-                        .rect_filled(video_rect, CornerRadius::ZERO, Color32::BLACK);
+                        .rect_filled(outer_rect, CornerRadius::ZERO, Color32::BLACK);
                     if let Some(tex) = &self.morph_tex {
                         ui.painter().image(
                             tex.id(),
@@ -2431,6 +2484,59 @@ impl StreamdApp {
                             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             Color32::WHITE,
                         );
+                    }
+
+                    // Fade center card title, timestamp & white hairline progress bar smoothly in as it closes
+                    if card_chrome_a > 0.02 {
+                        let ca = (255.0 * card_chrome_a) as u8;
+                        let fs = (13.5 * (outer_rect.width() / (400.0 * scale))).clamp(10.5, 14.5);
+                        let short_name: String = self.title.chars().take(28).collect();
+                        ui.painter().text(
+                            Pos2::new(outer_rect.left() + 12.0, outer_rect.bottom() - 16.0),
+                            Align2::LEFT_CENTER,
+                            short_name,
+                            FontId::proportional(fs),
+                            Color32::from_rgba_unmultiplied(255, 255, 255, ca),
+                        );
+                        if self.snap.duration > 0.0 {
+                            ui.painter().text(
+                                Pos2::new(outer_rect.right() - 12.0, outer_rect.bottom() - 16.0),
+                                Align2::RIGHT_CENTER,
+                                format!(
+                                    "{} / {}",
+                                    fmt_time(self.snap.position),
+                                    fmt_time(self.snap.duration)
+                                ),
+                                FontId::proportional(fs - 1.0),
+                                Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    (215.0 * card_chrome_a) as u8,
+                                ),
+                            );
+                            let pg_r = Rect::from_min_size(
+                                Pos2::new(outer_rect.left(), outer_rect.bottom() - 2.5),
+                                Vec2::new(outer_rect.width(), 2.5),
+                            );
+                            ui.painter().rect_filled(
+                                pg_r,
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    (48.0 * card_chrome_a) as u8,
+                                ),
+                            );
+                            let pct =
+                                (self.snap.position / self.snap.duration).clamp(0.0, 1.0) as f32;
+                            ui.painter().rect_filled(
+                                Rect::from_min_size(pg_r.min, Vec2::new(pg_r.width() * pct, 2.5)),
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, ca),
+                            );
+                        }
                     }
                 }
 
@@ -2463,14 +2569,14 @@ impl StreamdApp {
 
                 let p = ui.painter();
 
-                // 2. Real GPU Progressive Frosted Blur Pause Overlay
-                let pe = expo_out(self.pause_t);
-                if pe > 0.01 {
+                // 2. Silky Smooth Gradual GPU Frosted Blur Pause Overlay
+                let pe = smoothstep(self.pause_t);
+                if pe > 0.005 {
                     let scrim = Rect::from_min_size(
                         full_rect.min,
                         Vec2::new(full_rect.width() * 0.62, full_rect.height()),
                     );
-                    paint_frosted(p, &self.blur, scrim, [0.03, 0.03, 0.04, 0.52], pe, true);
+                    paint_frosted(p, &self.blur, scrim, [0.03, 0.03, 0.04, 0.48], pe, true);
 
                     let lx = full_rect.left() + (full_rect.width() * 0.07).max(40.0);
                     let cy = full_rect.center().y - 20.0 + (1.0 - pe) * 12.0;
@@ -2556,7 +2662,7 @@ impl StreamdApp {
                         Color32::from_rgba_unmultiplied(0, 0, 0, (205.0 * ce) as u8),
                     );
 
-                    // Top bar
+                    // Top bar (minimal: just Back + Title, no noisy network stats!)
                     let top_bar = Rect::from_min_size(
                         Pos2::new(
                             full_rect.left() + 20.0,
@@ -2572,36 +2678,7 @@ impl StreamdApp {
                                 self.begin_close_morph(ctx);
                                 return;
                             }
-                            ui.label(egui::RichText::new(&self.title).size(14.0));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let is_local = self.session.as_ref().map_or(false, |s| s.is_local);
-                                let stat_txt = if is_local {
-                                    let r = res_label(self.snap.width, self.snap.height);
-                                    if self.queue.len() > 1 {
-                                        format!(
-                                            "{} · {}/{}",
-                                            r,
-                                            self.queue_idx + 1,
-                                            self.queue.len()
-                                        )
-                                    } else {
-                                        r
-                                    }
-                                } else if self.status.percent >= 99.9 {
-                                    fmt_bytes(self.status.total.max(self.status.downloaded))
-                                } else {
-                                    format!(
-                                        "{:.0}% · {}/s",
-                                        self.status.percent,
-                                        fmt_bytes(self.status.speed_bps)
-                                    )
-                                };
-                                ui.label(
-                                    egui::RichText::new(stat_txt)
-                                        .size(12.0)
-                                        .color(Color32::from_rgba_unmultiplied(255, 255, 255, 130)),
-                                );
-                            });
+                            ui.label(egui::RichText::new(&self.title).size(14.5));
                         });
                     });
 
@@ -2632,8 +2709,21 @@ impl StreamdApp {
                         Color32::from_rgba_unmultiplied(255, 255, 255, (52.0 * ce) as u8),
                     );
 
+                    // Show subtle downloaded portion on rail + network-speed-reactive buffering pulse!
+                    if self.status.percent > 0.0 && self.status.percent < 100.0 {
+                        let dl_w =
+                            rail_rect.width() * (self.status.percent / 100.0).clamp(0.0, 1.0);
+                        sp.rect_filled(
+                            Rect::from_min_size(rail_rect.min, Vec2::new(dl_w, rail_h)),
+                            CornerRadius::ZERO,
+                            Color32::from_rgba_unmultiplied(255, 255, 255, (72.0 * ce) as u8),
+                        );
+                    }
                     if self.snap.buffering {
-                        let t = (ctx.input(|i| i.time) as f32 * 1.4).fract();
+                        // Pulse speed scales smoothly with live download throughput (0.35 Hz slow -> 2.4 Hz fast!)
+                        let mbps = (self.status.speed_bps as f32) / (1024.0 * 1024.0);
+                        let rate = (0.35 + mbps * 0.25).clamp(0.35, 2.4);
+                        let t = (ctx.input(|i| i.time) as f32 * rate).fract();
                         let bw = rail_rect.width() * 0.25;
                         let bx = rail_rect.left() + (rail_rect.width() + bw) * t - bw;
                         let pulse_r = Rect::from_min_max(
@@ -2643,7 +2733,7 @@ impl StreamdApp {
                         sp.rect_filled(
                             pulse_r,
                             CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 120),
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 135),
                         );
                         ctx.request_repaint();
                     }

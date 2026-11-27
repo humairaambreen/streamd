@@ -272,33 +272,36 @@ impl GpuBlur {
             gl.viewport(0, 0, bw, bh);
 
             // Pass 0: downsample + horizontal blur from src_tex -> fbo_b, then vertical -> fbo_a
+            // Scale blur radius smoothly with alpha so pause blur melts in gradually from sharp!
+            let r_scale = alpha.clamp(0.15, 1.0);
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_b));
             gl.bind_texture(glow::TEXTURE_2D, Some(st.src_tex));
             if let Some(loc) = &dir_loc {
-                gl.uniform_2_f32(Some(loc), 1.6_f32 / bw as f32, 0.0);
+                gl.uniform_2_f32(Some(loc), (1.6_f32 * r_scale) / bw as f32, 0.0);
             }
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_a));
             gl.bind_texture(glow::TEXTURE_2D, Some(st.tex_b));
             if let Some(loc) = &dir_loc {
-                gl.uniform_2_f32(Some(loc), 0.0, 1.6_f32 / bh as f32);
+                gl.uniform_2_f32(Some(loc), 0.0, (1.6_f32 * r_scale) / bh as f32);
             }
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
-            // Passes 1 & 2: progressively wider separable Gaussian passes for rich Apple frosted glass
+            // Passes 1 & 2: progressively wider separable Gaussian passes scaled smoothly by r_scale
             for spread in [3.2_f32, 5.5_f32] {
+                let s = spread * r_scale;
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_b));
                 gl.bind_texture(glow::TEXTURE_2D, Some(st.tex_a));
                 if let Some(loc) = &dir_loc {
-                    gl.uniform_2_f32(Some(loc), spread / bw as f32, 0.0);
+                    gl.uniform_2_f32(Some(loc), s / bw as f32, 0.0);
                 }
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(st.fbo_a));
                 gl.bind_texture(glow::TEXTURE_2D, Some(st.tex_b));
                 if let Some(loc) = &dir_loc {
-                    gl.uniform_2_f32(Some(loc), 0.0, spread / bh as f32);
+                    gl.uniform_2_f32(Some(loc), 0.0, s / bh as f32);
                 }
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }

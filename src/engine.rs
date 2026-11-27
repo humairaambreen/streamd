@@ -55,8 +55,6 @@ pub struct SessionMeta {
 
 #[derive(Clone, Default)]
 pub struct SessionStatus {
-    pub downloaded: u64,
-    pub total: u64,
     pub percent: f32,
     pub speed_bps: u64,
 }
@@ -1096,12 +1094,7 @@ impl Engine {
             } else {
                 0.0
             };
-            Some(SessionStatus {
-                downloaded,
-                total,
-                percent,
-                speed_bps,
-            })
+            Some(SessionStatus { percent, speed_bps })
         })
     }
 
