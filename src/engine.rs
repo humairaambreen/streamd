@@ -273,6 +273,37 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn parse_content_disposition_filename(headers: &HeaderMap) -> Option<String> {
+    let val = headers.get(H::CONTENT_DISPOSITION)?.to_str().ok()?;
+    for part in val.split(';') {
+        let p = part.trim();
+        if let Some(rest) = p
+            .strip_prefix("filename*=")
+            .or_else(|| p.strip_prefix("FILENAME*="))
+        {
+            let trimmed = rest.trim().trim_matches('"');
+            let encoded = trimmed.split("''").nth(1).unwrap_or(trimmed);
+            let dec = percent_decode(encoded);
+            if !dec.trim().is_empty() {
+                return Some(dec);
+            }
+        }
+    }
+    for part in val.split(';') {
+        let p = part.trim();
+        if let Some(rest) = p
+            .strip_prefix("filename=")
+            .or_else(|| p.strip_prefix("FILENAME="))
+        {
+            let clean = rest.trim().trim_matches('"').trim();
+            if !clean.is_empty() {
+                return Some(percent_decode(clean));
+            }
+        }
+    }
+    None
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -791,6 +822,7 @@ impl Engine {
                 anyhow::bail!("URL returned an HTML webpage instead of a direct video file.");
             }
 
+            let cd_name = parse_content_disposition_filename(resp.headers());
             let resolved_url = resp.url().to_string();
             let range_ok = status == StatusCode::PARTIAL_CONTENT;
 
@@ -924,14 +956,16 @@ impl Engine {
                 tokio::spawn(sequential_downloader(s.clone(), resp));
             }
 
-            let raw_name = url
-                .split('?')
-                .next()
-                .unwrap_or("")
-                .rsplit('/')
-                .next()
-                .unwrap_or("video");
-            let name = percent_decode(raw_name);
+            let name = cd_name.unwrap_or_else(|| {
+                let raw_name = url
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("video");
+                percent_decode(raw_name)
+            });
 
             Ok(SessionMeta {
                 id,
@@ -1077,6 +1111,7 @@ impl Engine {
         id: &str,
         local_path: Option<&str>,
         bucket_sec: u64,
+        scale_w: u32,
         gen_arc: &Arc<AtomicU64>,
         expected_gen: u64,
     ) -> Option<Bytes> {
@@ -1089,11 +1124,12 @@ impl Engine {
             if gen_check.load(Relaxed) != expected_gen {
                 return None;
             }
+            let cache_key = (bucket_sec << 16) | (scale_w as u64);
             let (input_src, sess_opt) = if let Some(lp) = local_owned {
                 (lp, None)
             } else {
                 let s = sess_map.lock().await.get(&id)?.clone();
-                if let Some(hit) = s.thumb_cache.lock().await.get(&bucket_sec).cloned() {
+                if let Some(hit) = s.thumb_cache.lock().await.get(&cache_key).cloned() {
                     return Some(hit);
                 }
                 let fully_cached = if s.range_ok {
@@ -1114,6 +1150,7 @@ impl Engine {
             if gen_check.load(Relaxed) != expected_gen {
                 return None;
             }
+            let qv = if scale_w >= 640 { "3" } else { "9" };
             let mut cmd = Command::new("ffmpeg");
             cmd.args([
                 "-v",
@@ -1133,9 +1170,9 @@ impl Engine {
                 "-frames:v",
                 "1",
                 "-q:v",
-                "10",
+                qv,
                 "-vf",
-                "scale=240:-2",
+                &format!("scale={scale_w}:-2"),
                 "-f",
                 "mjpeg",
                 "pipe:1",
@@ -1160,7 +1197,7 @@ impl Engine {
             if out.status.success() && !out.stdout.is_empty() {
                 let b = Bytes::from(out.stdout);
                 if let Some(s) = sess_opt {
-                    s.thumb_cache.lock().await.insert(bucket_sec, b.clone());
+                    s.thumb_cache.lock().await.insert(cache_key, b.clone());
                 }
                 Some(b)
             } else {

@@ -643,7 +643,8 @@ struct LibraryItem {
     is_local: bool,
     position: f64,
     duration: f64,
-    thumb: Option<TextureHandle>,
+    poster_thumb: Option<TextureHandle>, // shown when card is on side peek
+    resume_thumb: Option<TextureHandle>, // exact paused frame shown when card is focused in center
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -686,9 +687,11 @@ struct StreamdApp {
     last_scroll_step: Instant,
     expand_t: f32,
     closing_morph: bool,
+    morph_tex: Option<TextureHandle>,
+    poster_requested_for: Option<String>,
     pending_resume_pos: Option<f64>,
-    card_thumb_rx: mpsc::Receiver<(String, ColorImage)>,
-    card_thumb_tx: mpsc::Sender<(String, ColorImage)>,
+    card_thumb_rx: mpsc::Receiver<(String, bool, ColorImage)>, // (source, is_poster, image)
+    card_thumb_tx: mpsc::Sender<(String, bool, ColorImage)>,
 
     // Active session & Play Next queue
     session: Option<SessionMeta>,
@@ -804,6 +807,8 @@ impl StreamdApp {
             last_scroll_step: Instant::now() - Duration::from_secs(1),
             expand_t: 0.0,
             closing_morph: false,
+            morph_tex: None,
+            poster_requested_for: None,
             pending_resume_pos: None,
             card_thumb_rx,
             card_thumb_tx,
@@ -935,6 +940,7 @@ impl StreamdApp {
         sess_id: String,
         local_path: Option<String>,
         at_sec: u64,
+        is_poster: bool,
         ctx: &egui::Context,
     ) {
         let eng = self.engine.clone();
@@ -943,7 +949,7 @@ impl StreamdApp {
         let dummy_gen = Arc::new(AtomicU64::new(1));
         std::thread::spawn(move || {
             if let Some(jpeg) =
-                eng.fetch_thumb(&sess_id, local_path.as_deref(), at_sec, &dummy_gen, 1)
+                eng.fetch_thumb(&sess_id, local_path.as_deref(), at_sec, 960, &dummy_gen, 1)
             {
                 if let Ok(img) =
                     image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
@@ -953,11 +959,38 @@ impl StreamdApp {
                         [rgba.width() as usize, rgba.height() as usize],
                         rgba.as_raw(),
                     );
-                    let _ = tx.send((source_key, ci));
+                    let _ = tx.send((source_key, is_poster, ci));
                     egui_ctx.request_repaint();
                 }
             }
         });
+    }
+
+    fn capture_mpv_frame(&self, ctx: &egui::Context, tag: &str) -> Option<TextureHandle> {
+        let mpv = self.mpv.as_ref()?;
+        let tmp = std::env::temp_dir().join(format!(
+            "streamd_cap_{}_{:x}.jpg",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        mpv.screenshot_to_file(&tmp.to_string_lossy());
+        let bytes = std::fs::read(&tmp).ok();
+        let _ = std::fs::remove_file(&tmp);
+        let bytes = bytes?;
+        let img = image::load_from_memory(&bytes).ok()?;
+        let rgba = img.to_rgba8();
+        let ci = ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_raw(),
+        );
+        Some(ctx.load_texture(
+            format!("cap_{tag}_{}", bytes.len()),
+            ci,
+            TextureOptions::LINEAR,
+        ))
     }
 
     fn activate_session(&mut self, meta: SessionMeta) {
@@ -969,6 +1002,7 @@ impl StreamdApp {
         self.sub_msg.clear();
         self.closing_morph = false;
         self.expand_t = 0.0;
+        self.poster_requested_for = None;
 
         let source = if meta.is_local {
             meta.media_url.clone()
@@ -978,6 +1012,8 @@ impl StreamdApp {
         if !source.is_empty() {
             if let Some(pos_idx) = self.library.iter().position(|x| x.source == source) {
                 self.carousel_target = pos_idx + 1;
+                let it = &self.library[pos_idx];
+                self.morph_tex = it.resume_thumb.clone().or_else(|| it.poster_thumb.clone());
             } else {
                 self.library.insert(
                     0,
@@ -987,10 +1023,12 @@ impl StreamdApp {
                         is_local: meta.is_local,
                         position: 0.0,
                         duration: 0.0,
-                        thumb: None,
+                        poster_thumb: None,
+                        resume_thumb: None,
                     },
                 );
                 self.carousel_target = 1;
+                self.morph_tex = None;
             }
             self.carousel_pos = self.carousel_target as f32;
         }
@@ -1006,14 +1044,14 @@ impl StreamdApp {
         if self.closing_morph {
             return;
         }
-        // Save real metadata title, exact paused position, and capture exact paused frame thumbnail!
+        // Instantly capture the EXACT currently-displayed frame from mpv in ~10ms (works on remote & local!)
+        let exact_frame = self.capture_mpv_frame(ctx, "resume");
         if let Some(s) = self.session.clone() {
             let src = if s.is_local {
                 s.media_url.clone()
             } else {
                 self.url.trim().to_string()
             };
-            let cap_sec = self.snap.position.max(2.0).round() as u64;
             if let Some(item) = self.library.iter_mut().find(|x| x.source == src) {
                 if !self.snap.media_title.is_empty() {
                     item.name = self.snap.media_title.clone();
@@ -1024,10 +1062,15 @@ impl StreamdApp {
                     item.position = self.snap.position;
                     item.duration = self.snap.duration;
                 }
+                if let Some(tex) = exact_frame.clone() {
+                    item.resume_thumb = Some(tex.clone());
+                    if item.poster_thumb.is_none() {
+                        item.poster_thumb = Some(tex);
+                    }
+                }
             }
-            let lp = s.is_local.then(|| s.media_url.clone());
-            self.spawn_card_thumb(src, s.id.clone(), lp, cap_sec, ctx);
         }
+        self.morph_tex = exact_frame;
         self.opts_open = false;
         self.studio_tab = None;
         self.closing_morph = true;
@@ -1115,7 +1158,7 @@ impl StreamdApp {
 
         std::thread::spawn(move || {
             if let Some(jpeg) =
-                eng.fetch_thumb(&id, local_path.as_deref(), bucket, &gen_arc, my_gen)
+                eng.fetch_thumb(&id, local_path.as_deref(), bucket, 260, &gen_arc, my_gen)
             {
                 if gen_arc.load(Relaxed) != my_gen {
                     return;
@@ -1376,18 +1419,19 @@ impl StreamdApp {
                     let is_center = idx == self.carousel_target && d.abs() < 0.15;
 
                     if idx == 0 {
+                        // Card 0: Warm off-white Input Card (zero border, More options INSIDE!)
                         ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_PAPER);
-                        ui.painter().rect_stroke(
-                            cr,
-                            CornerRadius::ZERO,
-                            Stroke::new(1.0_f32, Color32::WHITE),
-                            egui::StrokeKind::Inside,
-                        );
 
                         let pad_x = cr.width() * 0.07;
                         let bar_h = (46.0 * (cr.width() / (400.0 * scale))).clamp(28.0, 50.0);
+                        // Shift input bar up slightly inside card when More options drawer opens
+                        let shift_up = if is_center {
+                            expo_out(self.hdrs_anim) * (cr.height() * 0.28)
+                        } else {
+                            0.0
+                        };
                         let bar_r = Rect::from_min_size(
-                            Pos2::new(cr.left() + pad_x, cr.center().y - bar_h * 0.5),
+                            Pos2::new(cr.left() + pad_x, cr.center().y - bar_h * 0.5 - shift_up),
                             Vec2::new(cr.width() - pad_x * 2.0, bar_h),
                         );
                         ui.painter()
@@ -1399,13 +1443,12 @@ impl StreamdApp {
                         );
                         ui.painter().rect_filled(act_r, CornerRadius::ZERO, BG);
 
-                        // Morph button icon: '+' when empty (pick file) -> crisp Play triangle when URL pasted!
                         if !self.url.trim().is_empty() {
                             draw_play(ui.painter(), act_r, TEXT_MAIN);
                         } else {
                             let pc = act_r.center();
                             let arm = bar_h * 0.17;
-                            let pst = Stroke::new(1.9_f32, TEXT_MAIN);
+                            let pst = Stroke::new(2.0_f32, TEXT_MAIN);
                             ui.painter().line_segment(
                                 [Pos2::new(pc.x, pc.y - arm), Pos2::new(pc.x, pc.y + arm)],
                                 pst,
@@ -1428,9 +1471,9 @@ impl StreamdApp {
                                     Color32::from_rgba_unmultiplied(77, 148, 255, 70);
                                 let te = egui::TextEdit::singleline(&mut self.url)
                                     .hint_text("Paste a link or open a file")
-                                    .font(FontId::proportional(13.0))
+                                    .font(FontId::proportional(14.0))
                                     .frame(false)
-                                    .margin(Margin::symmetric(12, ((bar_h - 18.0) * 0.5) as i8))
+                                    .margin(Margin::symmetric(12, ((bar_h - 19.0) * 0.5) as i8))
                                     .desired_width(input_r.width());
                                 let resp = ui.add_sized(input_r.size(), te);
                                 if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
@@ -1447,13 +1490,123 @@ impl StreamdApp {
                                     self.open_local_path(p, true);
                                 }
                             }
+
+                            // More options toggle & fields cleanly INSIDE Card 0 below the input bar!
+                            let opt_area = Rect::from_min_max(
+                                Pos2::new(bar_r.left(), bar_r.bottom() + 8.0),
+                                Pos2::new(bar_r.right(), cr.bottom() - 8.0),
+                            );
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(opt_area), |ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(if self.show_hdrs {
+                                                    "Hide options"
+                                                } else {
+                                                    "More options"
+                                                })
+                                                .size(12.5)
+                                                .strong()
+                                                .color(Color32::from_rgb(55, 55, 52)),
+                                            )
+                                            .fill(Color32::TRANSPARENT),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.show_hdrs = !self.show_hdrs;
+                                    }
+                                    if self.opening {
+                                        ui.label(
+                                            egui::RichText::new("Opening…")
+                                                .size(12.5)
+                                                .strong()
+                                                .color(ACCENT_BLUE),
+                                        );
+                                    }
+                                });
+
+                                if self.hdrs_anim > 0.05 {
+                                    let a = expo_out(self.hdrs_anim);
+                                    ui.scope(|ui| {
+                                        ui.set_opacity(a);
+                                        ui.visuals_mut().override_text_color =
+                                            Some(Color32::from_rgb(20, 20, 22));
+                                        let fw = opt_area.width();
+                                        for (val, hint) in [
+                                            (&mut self.referer, "Referer"),
+                                            (&mut self.cookie, "Cookie"),
+                                            (&mut self.user_agent, "User-Agent"),
+                                        ] {
+                                            let r = Rect::from_min_size(
+                                                ui.cursor().min,
+                                                Vec2::new(fw, 26.0),
+                                            );
+                                            ui.painter().rect_filled(
+                                                r,
+                                                CornerRadius::ZERO,
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 215),
+                                            );
+                                            ui.add_sized(
+                                                Vec2::new(fw, 26.0),
+                                                egui::TextEdit::singleline(val)
+                                                    .hint_text(hint)
+                                                    .font(FontId::proportional(12.0))
+                                                    .frame(false)
+                                                    .margin(Margin::symmetric(8, 4)),
+                                            );
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new(
+                                                            "Attach .part / .crdownload",
+                                                        )
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(Color32::from_rgb(35, 35, 38)),
+                                                    )
+                                                    .fill(Color32::from_rgba_unmultiplied(
+                                                        255, 255, 255, 190,
+                                                    )),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.seed_file = rfd::FileDialog::new().pick_file();
+                                            }
+                                            if let Some(sf) = &self.seed_file.clone() {
+                                                let n = sf
+                                                    .file_name()
+                                                    .and_then(|s| s.to_str())
+                                                    .unwrap_or("part");
+                                                ui.label(
+                                                    egui::RichText::new(n)
+                                                        .size(11.5)
+                                                        .color(Color32::from_rgb(60, 60, 58)),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new("x")
+                                                            .fill(Color32::TRANSPARENT),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.seed_file = None;
+                                                }
+                                            }
+                                        });
+                                    });
+                                }
+                            });
                         } else {
                             ui.painter().text(
                                 Pos2::new(bar_r.left() + 12.0, bar_r.center().y),
                                 Align2::LEFT_CENTER,
                                 "Paste a link or open a file",
                                 FontId::proportional(
-                                    (12.0 * (cr.width() / (400.0 * scale))).max(9.0),
+                                    (13.0 * (cr.width() / (400.0 * scale))).max(10.0),
                                 ),
                                 Color32::from_rgb(85, 85, 79),
                             );
@@ -1465,18 +1618,23 @@ impl StreamdApp {
                             }
                         }
                     } else {
-                        // Video Library Card with real paused/metadata thumbnail!
+                        // Video Library Card: ZERO gray border, dual HD thumbnails (paused frame on center, poster on side peek!)
                         let item = &self.library[idx - 1];
                         ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_DARK);
 
-                        if let Some(tex) = &item.thumb {
+                        let chosen_thumb = if is_center {
+                            item.resume_thumb.as_ref().or(item.poster_thumb.as_ref())
+                        } else {
+                            item.poster_thumb.as_ref().or(item.resume_thumb.as_ref())
+                        };
+
+                        if let Some(tex) = chosen_thumb {
                             ui.painter().image(
                                 tex.id(),
                                 cr,
                                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                                 Color32::WHITE,
                             );
-                            // Smooth bottom fade for legible title & time
                             paint_fade_v(
                                 ui.painter(),
                                 Rect::from_min_size(
@@ -1484,26 +1642,19 @@ impl StreamdApp {
                                     Vec2::new(cr.width(), cr.height() * 0.45),
                                 ),
                                 Color32::TRANSPARENT,
-                                Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 215),
                             );
                         }
-
-                        ui.painter().rect_stroke(
-                            cr,
-                            CornerRadius::ZERO,
-                            Stroke::new(1.0_f32, CARD_EDGE),
-                            egui::StrokeKind::Inside,
-                        );
 
                         if is_center {
                             draw_play(
                                 ui.painter(),
                                 cr,
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 215),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 230),
                             );
                         }
 
-                        let fs = (12.0 * (cr.width() / (400.0 * scale))).clamp(9.5, 13.0);
+                        let fs = (13.5 * (cr.width() / (400.0 * scale))).clamp(10.5, 14.5);
                         let status_str = if item.duration > 0.0 {
                             format!("{} / {}", fmt_time(item.position), fmt_time(item.duration))
                         } else {
@@ -1511,18 +1662,18 @@ impl StreamdApp {
                         };
                         let short_name: String = item.name.chars().take(28).collect();
                         ui.painter().text(
-                            Pos2::new(cr.left() + 10.0, cr.bottom() - 14.0),
+                            Pos2::new(cr.left() + 12.0, cr.bottom() - 16.0),
                             Align2::LEFT_CENTER,
                             short_name,
                             FontId::proportional(fs),
-                            TEXT_MAIN,
+                            Color32::WHITE,
                         );
                         ui.painter().text(
-                            Pos2::new(cr.right() - 10.0, cr.bottom() - 14.0),
+                            Pos2::new(cr.right() - 12.0, cr.bottom() - 16.0),
                             Align2::RIGHT_CENTER,
                             status_str,
-                            FontId::proportional(fs),
-                            TEXT_MAIN,
+                            FontId::proportional(fs - 1.0),
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 215),
                         );
 
                         let pg_r = Rect::from_min_size(
@@ -1540,12 +1691,46 @@ impl StreamdApp {
                             );
                         }
 
-                        let resp = ui.interact(cr, egui::Id::new(("cf_card", idx)), Sense::click());
-                        if resp.clicked() {
-                            if is_center {
-                                open_card_idx = Some((idx - 1, false));
-                            } else {
-                                self.carousel_target = idx;
+                        // "Start Over" cleanly INSIDE the top-right corner of the focused card!
+                        let mut clicked_start_over = false;
+                        if is_center && item.position > 3.0 {
+                            let so_r = Rect::from_min_size(
+                                Pos2::new(cr.right() - 92.0, cr.top() + 10.0),
+                                Vec2::new(82.0, 26.0),
+                            );
+                            let so_resp = ui.interact(
+                                so_r,
+                                egui::Id::new(("cf_start_over", idx)),
+                                Sense::click(),
+                            );
+                            let bg_a = if so_resp.hovered() { 185 } else { 130 };
+                            ui.painter().rect_filled(
+                                so_r,
+                                CornerRadius::ZERO,
+                                Color32::from_rgba_unmultiplied(0, 0, 0, bg_a),
+                            );
+                            ui.painter().text(
+                                so_r.center(),
+                                Align2::CENTER_CENTER,
+                                "Start Over",
+                                FontId::proportional(12.0),
+                                Color32::WHITE,
+                            );
+                            if so_resp.clicked() {
+                                clicked_start_over = true;
+                                open_card_idx = Some((idx - 1, true));
+                            }
+                        }
+
+                        if !clicked_start_over {
+                            let resp =
+                                ui.interact(cr, egui::Id::new(("cf_card", idx)), Sense::click());
+                            if resp.clicked() {
+                                if is_center {
+                                    open_card_idx = Some((idx - 1, false));
+                                } else {
+                                    self.carousel_target = idx;
+                                }
                             }
                         }
                     }
@@ -1566,141 +1751,31 @@ impl StreamdApp {
                     open_card_idx = Some((self.carousel_target - 1, false));
                 }
 
-                // Clean utility row below center card (Start Over for resumed video, or More options for Input card)
-                let foot_w = 400.0 * scale;
-                let foot_y = cy + (400.0 * scale * 9.0 / 16.0) * 0.5 + 16.0;
-                let foot_r = Rect::from_min_size(
-                    Pos2::new(cx - foot_w * 0.5, foot_y),
-                    Vec2::new(foot_w, 220.0),
-                );
-                ui.scope_builder(egui::UiBuilder::new().max_rect(foot_r), |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
-                    if self.carousel_target > 0 {
-                        if let Some(item) = self.library.get(self.carousel_target - 1) {
-                            if item.position > 3.0 {
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new("Start Over")
-                                                    .size(12.0)
-                                                    .color(Color32::from_gray(155)),
-                                            )
-                                            .fill(Color32::TRANSPARENT),
-                                        )
-                                        .clicked()
-                                    {
-                                        open_card_idx = Some((self.carousel_target - 1, true));
-                                    }
-                                });
-                            }
+                // Errors only (everything else lives cleanly inside the cards!)
+                if self.mpv_err.is_some() || !self.err_msg.is_empty() {
+                    let foot_w = 400.0 * scale;
+                    let foot_y = cy + (400.0 * scale * 9.0 / 16.0) * 0.5 + 18.0;
+                    let foot_r = Rect::from_min_size(
+                        Pos2::new(cx - foot_w * 0.5, foot_y),
+                        Vec2::new(foot_w, 80.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(foot_r), |ui| {
+                        if let Some(e) = &self.mpv_err {
+                            ui.label(
+                                egui::RichText::new(e)
+                                    .size(12.5)
+                                    .color(Color32::from_gray(200)),
+                            );
                         }
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::new(16.0, 0.0);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(if self.show_hdrs {
-                                            "Hide options"
-                                        } else {
-                                            "More options"
-                                        })
-                                        .size(12.0)
-                                        .color(Color32::from_gray(140)),
-                                    )
-                                    .fill(Color32::TRANSPARENT),
-                                )
-                                .clicked()
-                            {
-                                self.show_hdrs = !self.show_hdrs;
-                            }
-                            if self.opening {
-                                ui.label(
-                                    egui::RichText::new("Opening…")
-                                        .size(12.0)
-                                        .color(ACCENT_BLUE),
-                                );
-                            }
-                        });
-
-                        if self.hdrs_anim > 0.02 {
-                            let a = expo_out(self.hdrs_anim);
-                            ui.scope(|ui| {
-                                ui.set_opacity(a);
-                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 6.0);
-                                for (val, hint) in [
-                                    (&mut self.referer, "Referer"),
-                                    (&mut self.cookie, "Cookie"),
-                                    (&mut self.user_agent, "User-Agent"),
-                                ] {
-                                    let r = Rect::from_min_size(
-                                        ui.cursor().min,
-                                        Vec2::new(foot_w, 32.0),
-                                    );
-                                    ui.painter().rect_filled(r, CornerRadius::ZERO, CARD_DARK);
-                                    ui.add_sized(
-                                        Vec2::new(foot_w, 32.0),
-                                        egui::TextEdit::singleline(val)
-                                            .hint_text(hint)
-                                            .font(FontId::proportional(12.0))
-                                            .frame(false)
-                                            .margin(Margin::symmetric(10, 7)),
-                                    );
-                                }
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                egui::RichText::new(
-                                                    "Attach partial file (.part / .crdownload)",
-                                                )
-                                                .size(11.5)
-                                                .color(TEXT_MAIN),
-                                            )
-                                            .fill(CARD_DARK),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.seed_file = rfd::FileDialog::new().pick_file();
-                                    }
-                                    if let Some(sf) = &self.seed_file.clone() {
-                                        let n = sf
-                                            .file_name()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("part");
-                                        ui.label(
-                                            egui::RichText::new(n)
-                                                .size(11.5)
-                                                .color(Color32::from_gray(150)),
-                                        );
-                                        if ui
-                                            .add(egui::Button::new("x").fill(Color32::TRANSPARENT))
-                                            .clicked()
-                                        {
-                                            self.seed_file = None;
-                                        }
-                                    }
-                                });
-                            });
+                        if !self.err_msg.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&self.err_msg)
+                                    .size(12.5)
+                                    .color(Color32::from_gray(225)),
+                            );
                         }
-                    }
-
-                    if let Some(e) = &self.mpv_err {
-                        ui.label(
-                            egui::RichText::new(e)
-                                .size(12.0)
-                                .color(Color32::from_gray(200)),
-                        );
-                    }
-                    if !self.err_msg.is_empty() {
-                        ui.label(
-                            egui::RichText::new(&self.err_msg)
-                                .size(12.0)
-                                .color(Color32::from_gray(220)),
-                        );
-                    }
-                });
+                    });
+                }
             });
 
         if let Some((li, start_over)) = open_card_idx {
@@ -1725,15 +1800,37 @@ impl StreamdApp {
 
         if let Some(mpv) = &self.mpv {
             self.snap = mpv.poll_state();
-            // Adopt container metadata title when available
             if !self.snap.media_title.is_empty() && self.title != self.snap.media_title {
                 self.title = self.snap.media_title.clone();
             }
-            // Resume from last watched position once duration is loaded
             if let Some(pos) = self.pending_resume_pos {
                 if self.snap.duration > 0.0 {
                     mpv.seek_absolute(pos);
                     self.pending_resume_pos = None;
+                }
+            }
+            // Automatically capture the 960px main poster frame (at ~15% into video) for side-peek cards!
+            if self.snap.duration > 5.0 {
+                if let Some(s) = self.session.clone() {
+                    let src = if s.is_local {
+                        s.media_url.clone()
+                    } else {
+                        self.url.trim().to_string()
+                    };
+                    if self.poster_requested_for.as_deref() != Some(src.as_str()) {
+                        self.poster_requested_for = Some(src.clone());
+                        let needs_poster = self
+                            .library
+                            .iter()
+                            .find(|x| x.source == src)
+                            .map_or(false, |x| x.poster_thumb.is_none());
+                        if needs_poster {
+                            let poster_sec =
+                                ((self.snap.duration * 0.15).clamp(3.0, 120.0)).round() as u64;
+                            let lp = s.is_local.then(|| s.media_url.clone());
+                            self.spawn_card_thumb(src, s.id.clone(), lp, poster_sec, true, ctx);
+                        }
+                    }
                 }
             }
         }
@@ -1881,20 +1978,38 @@ impl StreamdApp {
                     ),
                 );
 
-                // 1. Hardware-decoded GPU video via libmpv OpenGL (morphs cleanly with video_rect!)
-                if let Some(mpv) = self.mpv.clone() {
-                    let cb = egui_glow::CallbackFn::new(move |info, painter| {
-                        let vp = info.viewport_in_pixels();
-                        let fbo = painter
-                            .intermediate_fbo()
-                            .map(|f| f.0.get() as i32)
-                            .unwrap_or(0);
-                        mpv.render_gl(fbo, vp.width_px, vp.height_px);
-                    });
-                    ui.painter().add(PaintCallback {
-                        rect: video_rect,
-                        callback: Arc::new(cb),
-                    });
+                // 1. Centered Card <-> Fullscreen morph:
+                // During morph (expand_t < 0.96 or closing), draw the centered crisp HD frame so OpenGL
+                // mpv never snaps to the bottom-left (0,0) origin; at full size render live mpv GPU!
+                if !self.closing_morph && exp >= 0.96 {
+                    if let Some(mpv) = self.mpv.clone() {
+                        let cb = egui_glow::CallbackFn::new(move |info, painter| {
+                            let vp = info.viewport_in_pixels();
+                            let fbo = painter
+                                .intermediate_fbo()
+                                .map(|f| f.0.get() as i32)
+                                .unwrap_or(0);
+                            mpv.render_gl(fbo, vp.width_px, vp.height_px);
+                        });
+                        ui.painter().add(PaintCallback {
+                            rect: full_rect,
+                            callback: Arc::new(cb),
+                        });
+                    }
+                } else {
+                    ui.painter().rect_filled(
+                        video_rect,
+                        CornerRadius::ZERO,
+                        Color32::from_rgb(24, 24, 26),
+                    );
+                    if let Some(tex) = &self.morph_tex {
+                        ui.painter().image(
+                            tex.id(),
+                            video_rect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
                 }
 
                 let right_cut = if self.studio_tab.is_some() {
@@ -3514,11 +3629,19 @@ impl StreamdApp {
 
 impl eframe::App for StreamdApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Receive decoded Cover-Flow card thumbnails
-        while let Ok((src_key, ci)) = self.card_thumb_rx.try_recv() {
-            let tex = ctx.load_texture(format!("card_{src_key}"), ci, TextureOptions::LINEAR);
+        // Receive decoded Cover-Flow card thumbnails (poster vs resume)
+        while let Ok((src_key, is_poster, ci)) = self.card_thumb_rx.try_recv() {
+            let tex = ctx.load_texture(
+                format!("card_{}_{}", is_poster, src_key),
+                ci,
+                TextureOptions::LINEAR,
+            );
             if let Some(item) = self.library.iter_mut().find(|x| x.source == src_key) {
-                item.thumb = Some(tex);
+                if is_poster {
+                    item.poster_thumb = Some(tex.clone());
+                } else {
+                    item.resume_thumb = Some(tex.clone());
+                }
             }
         }
 

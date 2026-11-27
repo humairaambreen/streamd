@@ -477,6 +477,11 @@ impl MpvPlayer {
         self.cmd_sync(&["stop"]);
     }
 
+    /// Captures the exact currently-displayed decoded video frame as a crisp JPEG in ~10ms.
+    pub fn screenshot_to_file(&self, path: &str) {
+        self.cmd_sync(&["screenshot-to-file", path, "video"]);
+    }
+
     pub fn toggle_pause(&self) {
         self.cmd_async(&["cycle", "pause"]);
     }
