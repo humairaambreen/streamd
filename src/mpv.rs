@@ -119,6 +119,7 @@ pub struct PlayerSnapshot {
     pub deband: bool,
     pub audio_delay: f64,
     pub pitch_correction: bool,
+    pub media_title: String,
     pub audio_tracks: Vec<TrackInfo>,
     pub sub_tracks: Vec<TrackInfo>,
     pub active_aid: i64,
@@ -587,6 +588,14 @@ impl MpvPlayer {
         self.set_flag("deband", on);
     }
 
+    pub fn set_video_quality_cap(&self, max_h: i64) {
+        if max_h <= 0 {
+            self.set_string("vf", "");
+        } else {
+            self.set_string("vf", &format!("scale=-2:'min(ih,{max_h})'"));
+        }
+    }
+
     pub fn set_brightness(&self, v: i64) {
         self.set_int64("brightness", v.clamp(-50, 50));
     }
@@ -840,6 +849,10 @@ impl MpvPlayer {
             deband: self.get_flag("deband"),
             audio_delay: self.get_double("audio-delay"),
             pitch_correction: self.get_flag("audio-pitch-correction"),
+            media_title: self
+                .get_string("metadata/by-key/title")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_default(),
             audio_tracks,
             sub_tracks,
             active_aid,

@@ -38,6 +38,43 @@ fn load_app_icon() -> Option<IconData> {
     })
 }
 
+/// Loads a single clean modern geometric sans-serif font (SF Pro on macOS, Segoe UI on Windows).
+fn setup_fonts(ctx: &egui::Context) {
+    let candidates: &[&str] = &[
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/SFNS.ttf",
+        #[cfg(target_os = "macos")]
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        #[cfg(target_os = "windows")]
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        #[cfg(all(unix, not(target_os = "macos")))]
+        "/usr/share/fonts/truetype/inter/Inter-Regular.ttf",
+        #[cfg(all(unix, not(target_os = "macos")))]
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "clean_sans".to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "clean_sans".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "clean_sans".to_owned());
+            ctx.set_fonts(fonts);
+            break;
+        }
+    }
+}
+
 fn fmt_bytes(b: u64) -> String {
     if b == 0 {
         return "0 B".into();
@@ -454,6 +491,46 @@ fn draw_back(p: &egui::Painter, r: Rect, col: Color32) {
     );
 }
 
+fn draw_chevron_right(p: &egui::Painter, r: Rect, col: Color32) {
+    let c = r.center();
+    let st = Stroke::new(1.5_f32, col);
+    p.line_segment(
+        [Pos2::new(c.x - 2.5, c.y - 4.5), Pos2::new(c.x + 2.5, c.y)],
+        st,
+    );
+    p.line_segment(
+        [Pos2::new(c.x + 2.5, c.y), Pos2::new(c.x - 2.5, c.y + 4.5)],
+        st,
+    );
+}
+
+fn more_options_row(ui: &mut egui::Ui, width: f32, label: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+    let bg = if resp.hovered() {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+    } else {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 10)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, bg);
+    ui.painter().text(
+        Pos2::new(rect.left() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(12.0),
+        Color32::WHITE,
+    );
+    let chev_r = Rect::from_min_size(
+        Pos2::new(rect.right() - 24.0, rect.top()),
+        Vec2::new(20.0, rect.height()),
+    );
+    draw_chevron_right(
+        ui.painter(),
+        chev_r,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+    );
+    resp.clicked()
+}
+
 fn draw_menu(p: &egui::Painter, r: Rect, col: Color32) {
     let c = r.center();
     let st = Stroke::new(1.5_f32, col);
@@ -566,6 +643,7 @@ struct LibraryItem {
     is_local: bool,
     position: f64,
     duration: f64,
+    thumb: Option<TextureHandle>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -604,6 +682,13 @@ struct StreamdApp {
     library: Vec<LibraryItem>,
     carousel_target: usize,
     carousel_pos: f32,
+    scroll_accum: f32,
+    last_scroll_step: Instant,
+    expand_t: f32,
+    closing_morph: bool,
+    pending_resume_pos: Option<f64>,
+    card_thumb_rx: mpsc::Receiver<(String, ColorImage)>,
+    card_thumb_tx: mpsc::Sender<(String, ColorImage)>,
 
     // Active session & Play Next queue
     session: Option<SessionMeta>,
@@ -615,7 +700,8 @@ struct StreamdApp {
     status: SessionStatus,
     last_status_poll: Instant,
 
-    // Studio state toggles (tracked for UI highlight)
+    // Studio state toggles
+    quality_cap: i64, // 0 = Original, 1080, 720, 480
     aspect_mode: String,
     upscaler: String,
     night_mode: bool,
@@ -684,6 +770,7 @@ impl StreamdApp {
         visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 55);
         visuals.selection.stroke = Stroke::NONE;
         cc.egui_ctx.set_visuals(visuals);
+        setup_fonts(&cc.egui_ctx);
 
         let (mpv, mpv_err) = match cc.get_proc_address {
             Some(gpa) => match MpvPlayer::new(cc.egui_ctx.clone(), gpa) {
@@ -694,6 +781,7 @@ impl StreamdApp {
         };
 
         let (thumb_tx, thumb_rx) = mpsc::channel();
+        let (card_thumb_tx, card_thumb_rx) = mpsc::channel();
 
         let mut app = Self {
             engine,
@@ -712,6 +800,13 @@ impl StreamdApp {
             library: Vec::new(),
             carousel_target: 0,
             carousel_pos: 0.0,
+            scroll_accum: 0.0,
+            last_scroll_step: Instant::now() - Duration::from_secs(1),
+            expand_t: 0.0,
+            closing_morph: false,
+            pending_resume_pos: None,
+            card_thumb_rx,
+            card_thumb_tx,
             session: None,
             queue: Vec::new(),
             queue_idx: 0,
@@ -720,6 +815,7 @@ impl StreamdApp {
             snap: PlayerSnapshot::default(),
             status: SessionStatus::default(),
             last_status_poll: Instant::now(),
+            quality_cap: 0,
             aspect_mode: "auto".into(),
             upscaler: "spline36".into(),
             night_mode: false,
@@ -833,35 +929,70 @@ impl StreamdApp {
         self.flash(self.title.clone());
     }
 
+    fn spawn_card_thumb(
+        &self,
+        source_key: String,
+        sess_id: String,
+        local_path: Option<String>,
+        at_sec: u64,
+        ctx: &egui::Context,
+    ) {
+        let eng = self.engine.clone();
+        let tx = self.card_thumb_tx.clone();
+        let egui_ctx = ctx.clone();
+        let dummy_gen = Arc::new(AtomicU64::new(1));
+        std::thread::spawn(move || {
+            if let Some(jpeg) =
+                eng.fetch_thumb(&sess_id, local_path.as_deref(), at_sec, &dummy_gen, 1)
+            {
+                if let Ok(img) =
+                    image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+                {
+                    let rgba = img.to_rgba8();
+                    let ci = ColorImage::from_rgba_unmultiplied(
+                        [rgba.width() as usize, rgba.height() as usize],
+                        rgba.as_raw(),
+                    );
+                    let _ = tx.send((source_key, ci));
+                    egui_ctx.request_repaint();
+                }
+            }
+        });
+    }
+
     fn activate_session(&mut self, meta: SessionMeta) {
         let (t, y) = clean_title(&meta.name);
         self.title = t.clone();
         self.year = y;
-        self.sub_query = t;
+        self.sub_query = t.clone();
         self.sub_results.clear();
         self.sub_msg.clear();
+        self.closing_morph = false;
+        self.expand_t = 0.0;
 
-        // Record in Cover-Flow library cards
         let source = if meta.is_local {
             meta.media_url.clone()
         } else {
             self.url.trim().to_string()
         };
         if !source.is_empty() {
-            if let Some(existing) = self.library.iter_mut().find(|x| x.source == source) {
-                existing.name = meta.name.clone();
+            if let Some(pos_idx) = self.library.iter().position(|x| x.source == source) {
+                self.carousel_target = pos_idx + 1;
             } else {
                 self.library.insert(
                     0,
                     LibraryItem {
-                        name: meta.name.clone(),
+                        name: t,
                         source,
                         is_local: meta.is_local,
                         position: 0.0,
                         duration: 0.0,
+                        thumb: None,
                     },
                 );
+                self.carousel_target = 1;
             }
+            self.carousel_pos = self.carousel_target as f32;
         }
 
         if let Some(mpv) = &self.mpv {
@@ -871,21 +1002,38 @@ impl StreamdApp {
         self.last_mouse_move = Instant::now();
     }
 
-    fn close_session(&mut self) {
-        // Save last watched progress onto the Cover-Flow card
-        if let Some(s) = &self.session {
+    fn begin_close_morph(&mut self, ctx: &egui::Context) {
+        if self.closing_morph {
+            return;
+        }
+        // Save real metadata title, exact paused position, and capture exact paused frame thumbnail!
+        if let Some(s) = self.session.clone() {
             let src = if s.is_local {
                 s.media_url.clone()
             } else {
                 self.url.trim().to_string()
             };
+            let cap_sec = self.snap.position.max(2.0).round() as u64;
             if let Some(item) = self.library.iter_mut().find(|x| x.source == src) {
+                if !self.snap.media_title.is_empty() {
+                    item.name = self.snap.media_title.clone();
+                } else if !self.title.is_empty() {
+                    item.name = self.title.clone();
+                }
                 if self.snap.duration > 0.0 {
                     item.position = self.snap.position;
                     item.duration = self.snap.duration;
                 }
             }
+            let lp = s.is_local.then(|| s.media_url.clone());
+            self.spawn_card_thumb(src, s.id.clone(), lp, cap_sec, ctx);
         }
+        self.opts_open = false;
+        self.studio_tab = None;
+        self.closing_morph = true;
+    }
+
+    fn close_session(&mut self) {
         self.thumb_gen.fetch_add(1, Relaxed);
         if let Some(mpv) = &self.mpv {
             mpv.stop();
@@ -895,6 +1043,9 @@ impl StreamdApp {
                 self.engine.close(&s.id);
             }
         }
+        self.closing_morph = false;
+        self.expand_t = 0.0;
+        self.pending_resume_pos = None;
         self.queue.clear();
         self.queue_idx = 0;
         self.thumb_cache.clear();
@@ -1091,7 +1242,7 @@ impl StreamdApp {
             self.carousel_target = total_cards.saturating_sub(1);
         }
 
-        // Keyboard / scroll-wheel Cover-Flow navigation (when not typing in text input)
+        // Debounced Cover-Flow navigation: 1 trackpad swipe = exactly 1 card (never skips middle!)
         if !ctx.wants_keyboard_input() && total_cards > 1 {
             ctx.input(|i| {
                 if i.key_pressed(Key::ArrowRight) && self.carousel_target + 1 < total_cards {
@@ -1100,11 +1251,26 @@ impl StreamdApp {
                 if i.key_pressed(Key::ArrowLeft) && self.carousel_target > 0 {
                     self.carousel_target -= 1;
                 }
-                let scroll = i.raw_scroll_delta.x + i.raw_scroll_delta.y;
-                if scroll < -28.0 && self.carousel_target + 1 < total_cards {
-                    self.carousel_target += 1;
-                } else if scroll > 28.0 && self.carousel_target > 0 {
-                    self.carousel_target -= 1;
+                let scroll = if i.raw_scroll_delta.x.abs() > i.raw_scroll_delta.y.abs() {
+                    i.raw_scroll_delta.x
+                } else {
+                    i.raw_scroll_delta.y
+                };
+                if scroll.abs() > 0.5 {
+                    self.scroll_accum += scroll;
+                    if self.last_scroll_step.elapsed() >= Duration::from_millis(260) {
+                        if self.scroll_accum < -38.0 && self.carousel_target + 1 < total_cards {
+                            self.carousel_target += 1;
+                            self.scroll_accum = 0.0;
+                            self.last_scroll_step = Instant::now();
+                        } else if self.scroll_accum > 38.0 && self.carousel_target > 0 {
+                            self.carousel_target -= 1;
+                            self.scroll_accum = 0.0;
+                            self.last_scroll_step = Instant::now();
+                        }
+                    }
+                } else {
+                    self.scroll_accum *= 0.8;
                 }
             });
         }
@@ -1130,7 +1296,7 @@ impl StreamdApp {
         const ACCENT_BLUE: Color32 = Color32::from_rgb(77, 148, 255); // #4D94FF
         const TEXT_MAIN: Color32 = Color32::from_rgb(232, 232, 227);
 
-        let mut open_card_idx: Option<usize> = None;
+        let mut open_card_idx: Option<(usize, bool)> = None; // (library_idx, start_over)
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
@@ -1140,17 +1306,14 @@ impl StreamdApp {
                 let cy = rect.center().y - 34.0;
                 let scale = (rect.width() / 960.0).clamp(0.85, 1.35);
 
-                // Compute smooth Cover-Flow geometry for each card index relative to carousel_pos
                 let card_geom = |d: f32| -> (Rect, f32) {
                     let ad = d.abs();
-                    // Interpolate width: 400 at d=0, 288 at d=1, 220 at d=2
                     let w = if ad <= 1.0 {
                         400.0 + (288.0 - 400.0) * ad
                     } else {
                         (288.0 + (220.0 - 288.0) * (ad - 1.0).min(1.0)).max(180.0)
                     } * scale;
                     let h = w * 9.0 / 16.0;
-                    // Smooth x offset matching mockup (300px step at 1x, compressing further out)
                     let sign = if d >= 0.0 { 1.0 } else { -1.0 };
                     let x_off = if ad <= 1.0 {
                         sign * ad * 300.0 * scale
@@ -1166,7 +1329,6 @@ impl StreamdApp {
                     (r, dim)
                 };
 
-                // Depth sort: furthest from center first so focal card renders on top
                 let mut order: Vec<usize> = (0..total_cards).collect();
                 order.sort_by(|&a, &b| {
                     let da = (a as f32 - self.carousel_pos).abs();
@@ -1174,31 +1336,34 @@ impl StreamdApp {
                     db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                // 1. Floor reflections beneath each visible card
-                for &idx in &order {
-                    let d = idx as f32 - self.carousel_pos;
-                    if d.abs() > 2.6 {
-                        continue;
+                // 1. Floor reflections (smoothly fade out when headers drawer expands so zero overlap!)
+                let refl_vis = 1.0 - expo_out(self.hdrs_anim);
+                if refl_vis > 0.02 {
+                    for &idx in &order {
+                        let d = idx as f32 - self.carousel_pos;
+                        if d.abs() > 2.6 {
+                            continue;
+                        }
+                        let (cr, dim) = card_geom(d);
+                        let ref_h = (cr.height() * 0.36).min(82.0 * scale);
+                        let rr = Rect::from_min_size(
+                            Pos2::new(cr.left(), cr.bottom() + 3.0),
+                            Vec2::new(cr.width(), ref_h),
+                        );
+                        let base_col = if idx == 0 { CARD_PAPER } else { CARD_DARK };
+                        let top_a = ((1.0 - dim) * 85.0 * refl_vis) as u8;
+                        paint_fade_v(
+                            ui.painter(),
+                            rr,
+                            Color32::from_rgba_unmultiplied(
+                                base_col.r(),
+                                base_col.g(),
+                                base_col.b(),
+                                top_a,
+                            ),
+                            Color32::TRANSPARENT,
+                        );
                     }
-                    let (cr, dim) = card_geom(d);
-                    let ref_h = (cr.height() * 0.42).min(95.0 * scale);
-                    let rr = Rect::from_min_size(
-                        Pos2::new(cr.left(), cr.bottom() + 3.0),
-                        Vec2::new(cr.width(), ref_h),
-                    );
-                    let base_col = if idx == 0 { CARD_PAPER } else { CARD_DARK };
-                    let top_a = ((1.0 - dim) * 95.0) as u8;
-                    paint_fade_v(
-                        ui.painter(),
-                        rr,
-                        Color32::from_rgba_unmultiplied(
-                            base_col.r(),
-                            base_col.g(),
-                            base_col.b(),
-                            top_a,
-                        ),
-                        Color32::TRANSPARENT,
-                    );
                 }
 
                 // 2. Render Cover-Flow cards back-to-front
@@ -1211,7 +1376,6 @@ impl StreamdApp {
                     let is_center = idx == self.carousel_target && d.abs() < 0.15;
 
                     if idx == 0 {
-                        // Card 0: Warm off-white Input Card (.pn)
                         ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_PAPER);
                         ui.painter().rect_stroke(
                             cr,
@@ -1221,7 +1385,7 @@ impl StreamdApp {
                         );
 
                         let pad_x = cr.width() * 0.07;
-                        let bar_h = (48.0 * (cr.width() / (400.0 * scale))).clamp(28.0, 52.0);
+                        let bar_h = (46.0 * (cr.width() / (400.0 * scale))).clamp(28.0, 50.0);
                         let bar_r = Rect::from_min_size(
                             Pos2::new(cr.left() + pad_x, cr.center().y - bar_h * 0.5),
                             Vec2::new(cr.width() - pad_x * 2.0, bar_h),
@@ -1229,28 +1393,33 @@ impl StreamdApp {
                         ui.painter()
                             .rect_filled(bar_r, CornerRadius::ZERO, Color32::WHITE);
 
-                        let plus_r = Rect::from_min_size(
+                        let act_r = Rect::from_min_size(
                             Pos2::new(bar_r.right() - bar_h, bar_r.top()),
                             Vec2::new(bar_h, bar_h),
                         );
-                        ui.painter().rect_filled(plus_r, CornerRadius::ZERO, BG);
-                        // Crisp '+' vector icon
-                        let pc = plus_r.center();
-                        let arm = bar_h * 0.17;
-                        let pst = Stroke::new(2.0_f32, TEXT_MAIN);
-                        ui.painter().line_segment(
-                            [Pos2::new(pc.x, pc.y - arm), Pos2::new(pc.x, pc.y + arm)],
-                            pst,
-                        );
-                        ui.painter().line_segment(
-                            [Pos2::new(pc.x - arm, pc.y), Pos2::new(pc.x + arm, pc.y)],
-                            pst,
-                        );
+                        ui.painter().rect_filled(act_r, CornerRadius::ZERO, BG);
+
+                        // Morph button icon: '+' when empty (pick file) -> crisp Play triangle when URL pasted!
+                        if !self.url.trim().is_empty() {
+                            draw_play(ui.painter(), act_r, TEXT_MAIN);
+                        } else {
+                            let pc = act_r.center();
+                            let arm = bar_h * 0.17;
+                            let pst = Stroke::new(1.9_f32, TEXT_MAIN);
+                            ui.painter().line_segment(
+                                [Pos2::new(pc.x, pc.y - arm), Pos2::new(pc.x, pc.y + arm)],
+                                pst,
+                            );
+                            ui.painter().line_segment(
+                                [Pos2::new(pc.x - arm, pc.y), Pos2::new(pc.x + arm, pc.y)],
+                                pst,
+                            );
+                        }
 
                         if is_center {
                             let input_r = Rect::from_min_max(
                                 bar_r.min,
-                                Pos2::new(plus_r.left(), bar_r.bottom()),
+                                Pos2::new(act_r.left(), bar_r.bottom()),
                             );
                             ui.scope_builder(egui::UiBuilder::new().max_rect(input_r), |ui| {
                                 ui.visuals_mut().override_text_color =
@@ -1259,7 +1428,7 @@ impl StreamdApp {
                                     Color32::from_rgba_unmultiplied(77, 148, 255, 70);
                                 let te = egui::TextEdit::singleline(&mut self.url)
                                     .hint_text("Paste a link or open a file")
-                                    .font(FontId::monospace(12.5))
+                                    .font(FontId::proportional(13.0))
                                     .frame(false)
                                     .margin(Margin::symmetric(12, ((bar_h - 18.0) * 0.5) as i8))
                                     .desired_width(input_r.width());
@@ -1269,9 +1438,9 @@ impl StreamdApp {
                                 }
                             });
 
-                            let plus_resp =
-                                ui.interact(plus_r, egui::Id::new("cf_plus_btn"), Sense::click());
-                            if plus_resp.clicked() {
+                            let act_resp =
+                                ui.interact(act_r, egui::Id::new("cf_plus_btn"), Sense::click());
+                            if act_resp.clicked() {
                                 if !self.url.trim().is_empty() {
                                     self.start_open_url();
                                 } else if let Some(p) = rfd::FileDialog::new().pick_file() {
@@ -1279,12 +1448,13 @@ impl StreamdApp {
                                 }
                             }
                         } else {
-                            // Preview text inside non-centered input card
                             ui.painter().text(
                                 Pos2::new(bar_r.left() + 12.0, bar_r.center().y),
                                 Align2::LEFT_CENTER,
                                 "Paste a link or open a file",
-                                FontId::monospace((11.5 * (cr.width() / (400.0 * scale))).max(8.5)),
+                                FontId::proportional(
+                                    (12.0 * (cr.width() / (400.0 * scale))).max(9.0),
+                                ),
                                 Color32::from_rgb(85, 85, 79),
                             );
                             if ui
@@ -1295,9 +1465,29 @@ impl StreamdApp {
                             }
                         }
                     } else {
-                        // Video Library Card (.th)
+                        // Video Library Card with real paused/metadata thumbnail!
                         let item = &self.library[idx - 1];
                         ui.painter().rect_filled(cr, CornerRadius::ZERO, CARD_DARK);
+
+                        if let Some(tex) = &item.thumb {
+                            ui.painter().image(
+                                tex.id(),
+                                cr,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                            // Smooth bottom fade for legible title & time
+                            paint_fade_v(
+                                ui.painter(),
+                                Rect::from_min_size(
+                                    Pos2::new(cr.left(), cr.bottom() - cr.height() * 0.45),
+                                    Vec2::new(cr.width(), cr.height() * 0.45),
+                                ),
+                                Color32::TRANSPARENT,
+                                Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                            );
+                        }
+
                         ui.painter().rect_stroke(
                             cr,
                             CornerRadius::ZERO,
@@ -1305,39 +1495,36 @@ impl StreamdApp {
                             egui::StrokeKind::Inside,
                         );
 
-                        // Subtle centered Play triangle on focal card
                         if is_center {
                             draw_play(
                                 ui.painter(),
                                 cr,
-                                Color32::from_rgba_unmultiplied(232, 232, 227, 175),
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 215),
                             );
                         }
 
-                        // Bottom status row: filename left, timestamp/NEW right
-                        let fs = (11.5 * (cr.width() / (400.0 * scale))).clamp(9.0, 12.5);
+                        let fs = (12.0 * (cr.width() / (400.0 * scale))).clamp(9.5, 13.0);
                         let status_str = if item.duration > 0.0 {
                             format!("{} / {}", fmt_time(item.position), fmt_time(item.duration))
                         } else {
                             "NEW".into()
                         };
-                        let short_name: String = item.name.chars().take(24).collect();
+                        let short_name: String = item.name.chars().take(28).collect();
                         ui.painter().text(
                             Pos2::new(cr.left() + 10.0, cr.bottom() - 14.0),
                             Align2::LEFT_CENTER,
                             short_name,
-                            FontId::monospace(fs),
+                            FontId::proportional(fs),
                             TEXT_MAIN,
                         );
                         ui.painter().text(
                             Pos2::new(cr.right() - 10.0, cr.bottom() - 14.0),
                             Align2::RIGHT_CENTER,
                             status_str,
-                            FontId::monospace(fs),
+                            FontId::proportional(fs),
                             TEXT_MAIN,
                         );
 
-                        // 3px bottom progress bar (#3A3A3D track, #4D94FF fill)
                         let pg_r = Rect::from_min_size(
                             Pos2::new(cr.left(), cr.bottom() - 3.0),
                             Vec2::new(cr.width(), 3.0),
@@ -1356,14 +1543,13 @@ impl StreamdApp {
                         let resp = ui.interact(cr, egui::Id::new(("cf_card", idx)), Sense::click());
                         if resp.clicked() {
                             if is_center {
-                                open_card_idx = Some(idx - 1);
+                                open_card_idx = Some((idx - 1, false));
                             } else {
                                 self.carousel_target = idx;
                             }
                         }
                     }
 
-                    // Smooth distance dim overlay (.dim)
                     if dim > 0.01 {
                         ui.painter().rect_filled(
                             cr,
@@ -1373,36 +1559,55 @@ impl StreamdApp {
                     }
                 }
 
-                // Enter key opens the currently focused video card
                 if !ctx.wants_keyboard_input()
                     && self.carousel_target > 0
                     && ctx.input(|i| i.key_pressed(Key::Enter))
                 {
-                    open_card_idx = Some(self.carousel_target - 1);
+                    open_card_idx = Some((self.carousel_target - 1, false));
                 }
 
-                // Subtle bottom utility row (Headers / Resume & Status/Errors)
+                // Clean utility row below center card (Start Over for resumed video, or More options for Input card)
                 let foot_w = 400.0 * scale;
-                let foot_y = cy + (400.0 * scale * 9.0 / 16.0) * 0.5 + 36.0;
+                let foot_y = cy + (400.0 * scale * 9.0 / 16.0) * 0.5 + 16.0;
                 let foot_r = Rect::from_min_size(
                     Pos2::new(cx - foot_w * 0.5, foot_y),
                     Vec2::new(foot_w, 220.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(foot_r), |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
-                    if self.carousel_target == 0 {
+                    if self.carousel_target > 0 {
+                        if let Some(item) = self.library.get(self.carousel_target - 1) {
+                            if item.position > 3.0 {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Start Over")
+                                                    .size(12.0)
+                                                    .color(Color32::from_gray(155)),
+                                            )
+                                            .fill(Color32::TRANSPARENT),
+                                        )
+                                        .clicked()
+                                    {
+                                        open_card_idx = Some((self.carousel_target - 1, true));
+                                    }
+                                });
+                            }
+                        }
+                    } else {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(16.0, 0.0);
                             if ui
                                 .add(
                                     egui::Button::new(
                                         egui::RichText::new(if self.show_hdrs {
-                                            "− headers"
+                                            "Hide options"
                                         } else {
-                                            "+ headers / resume"
+                                            "More options"
                                         })
-                                        .font(FontId::monospace(11.5))
-                                        .color(Color32::from_gray(120)),
+                                        .size(12.0)
+                                        .color(Color32::from_gray(140)),
                                     )
                                     .fill(Color32::TRANSPARENT),
                                 )
@@ -1412,8 +1617,8 @@ impl StreamdApp {
                             }
                             if self.opening {
                                 ui.label(
-                                    egui::RichText::new("opening…")
-                                        .font(FontId::monospace(11.5))
+                                    egui::RichText::new("Opening…")
+                                        .size(12.0)
                                         .color(ACCENT_BLUE),
                                 );
                             }
@@ -1423,7 +1628,7 @@ impl StreamdApp {
                             let a = expo_out(self.hdrs_anim);
                             ui.scope(|ui| {
                                 ui.set_opacity(a);
-                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 5.0);
+                                ui.spacing_mut().item_spacing = Vec2::new(0.0, 6.0);
                                 for (val, hint) in [
                                     (&mut self.referer, "Referer"),
                                     (&mut self.cookie, "Cookie"),
@@ -1438,7 +1643,7 @@ impl StreamdApp {
                                         Vec2::new(foot_w, 32.0),
                                         egui::TextEdit::singleline(val)
                                             .hint_text(hint)
-                                            .font(FontId::monospace(11.5))
+                                            .font(FontId::proportional(12.0))
                                             .frame(false)
                                             .margin(Margin::symmetric(10, 7)),
                                     );
@@ -1447,9 +1652,11 @@ impl StreamdApp {
                                     if ui
                                         .add(
                                             egui::Button::new(
-                                                egui::RichText::new("attach .part / .crdownload")
-                                                    .font(FontId::monospace(11.0))
-                                                    .color(TEXT_MAIN),
+                                                egui::RichText::new(
+                                                    "Attach partial file (.part / .crdownload)",
+                                                )
+                                                .size(11.5)
+                                                .color(TEXT_MAIN),
                                             )
                                             .fill(CARD_DARK),
                                         )
@@ -1464,7 +1671,7 @@ impl StreamdApp {
                                             .unwrap_or("part");
                                         ui.label(
                                             egui::RichText::new(n)
-                                                .font(FontId::monospace(11.0))
+                                                .size(11.5)
                                                 .color(Color32::from_gray(150)),
                                         );
                                         if ui
@@ -1482,22 +1689,27 @@ impl StreamdApp {
                     if let Some(e) = &self.mpv_err {
                         ui.label(
                             egui::RichText::new(e)
-                                .font(FontId::monospace(11.5))
+                                .size(12.0)
                                 .color(Color32::from_gray(200)),
                         );
                     }
                     if !self.err_msg.is_empty() {
                         ui.label(
                             egui::RichText::new(&self.err_msg)
-                                .font(FontId::monospace(11.5))
+                                .size(12.0)
                                 .color(Color32::from_gray(220)),
                         );
                     }
                 });
             });
 
-        if let Some(li) = open_card_idx {
+        if let Some((li, start_over)) = open_card_idx {
             if let Some(item) = self.library.get(li).cloned() {
+                self.pending_resume_pos = if !start_over && item.position > 3.0 {
+                    Some(item.position)
+                } else {
+                    None
+                };
                 if item.is_local {
                     self.open_local_path(PathBuf::from(item.source), true);
                 } else {
@@ -1513,6 +1725,28 @@ impl StreamdApp {
 
         if let Some(mpv) = &self.mpv {
             self.snap = mpv.poll_state();
+            // Adopt container metadata title when available
+            if !self.snap.media_title.is_empty() && self.title != self.snap.media_title {
+                self.title = self.snap.media_title.clone();
+            }
+            // Resume from last watched position once duration is loaded
+            if let Some(pos) = self.pending_resume_pos {
+                if self.snap.duration > 0.0 {
+                    mpv.seek_absolute(pos);
+                    self.pending_resume_pos = None;
+                }
+            }
+        }
+
+        // Smooth Card <-> Fullscreen morph animation
+        let exp_target = if self.closing_morph { 0.0 } else { 1.0 };
+        self.expand_t += (exp_target - self.expand_t) * (dt * 11.0).min(1.0);
+        if (self.expand_t - exp_target).abs() > 0.003 {
+            ctx.request_repaint();
+        }
+        if self.closing_morph && self.expand_t <= 0.04 {
+            self.close_session();
+            return;
         }
         if self.last_status_poll.elapsed() >= Duration::from_millis(500) {
             if let Some(s) = &self.session {
@@ -1623,11 +1857,31 @@ impl StreamdApp {
         let mut want_fs_toggle = false;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::BLACK))
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(14, 14, 15)))
             .show(ctx, |ui| {
                 let full_rect = ui.max_rect();
+                let exp = expo_out(self.expand_t);
 
-                // 1. Hardware-decoded GPU video via libmpv OpenGL
+                // Compute smooth morphed rect from centered 400x225 Cover-Flow card -> full window!
+                let scale = (full_rect.width() / 960.0).clamp(0.85, 1.35);
+                let card_w = 400.0 * scale;
+                let card_h = card_w * 9.0 / 16.0;
+                let start_rect = Rect::from_center_size(
+                    Pos2::new(full_rect.center().x, full_rect.center().y - 34.0),
+                    Vec2::new(card_w, card_h),
+                );
+                let video_rect = Rect::from_min_max(
+                    Pos2::new(
+                        start_rect.left() + (full_rect.left() - start_rect.left()) * exp,
+                        start_rect.top() + (full_rect.top() - start_rect.top()) * exp,
+                    ),
+                    Pos2::new(
+                        start_rect.right() + (full_rect.right() - start_rect.right()) * exp,
+                        start_rect.bottom() + (full_rect.bottom() - start_rect.bottom()) * exp,
+                    ),
+                );
+
+                // 1. Hardware-decoded GPU video via libmpv OpenGL (morphs cleanly with video_rect!)
                 if let Some(mpv) = self.mpv.clone() {
                     let cb = egui_glow::CallbackFn::new(move |info, painter| {
                         let vp = info.viewport_in_pixels();
@@ -1638,7 +1892,7 @@ impl StreamdApp {
                         mpv.render_gl(fbo, vp.width_px, vp.height_px);
                     });
                     ui.painter().add(PaintCallback {
-                        rect: full_rect,
+                        rect: video_rect,
                         callback: Arc::new(cb),
                     });
                 }
@@ -1778,7 +2032,7 @@ impl StreamdApp {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
                             if icon_btn(ui, Vec2::new(28.0, 28.0), draw_back).clicked() {
-                                self.close_session();
+                                self.begin_close_morph(ctx);
                                 return;
                             }
                             ui.label(egui::RichText::new(&self.title).size(14.0));
@@ -2091,18 +2345,13 @@ impl StreamdApp {
                     ui.painter().rect_filled(
                         orect,
                         CornerRadius::ZERO,
-                        Color32::from_rgba_unmultiplied(10, 10, 12, (232.0 * oe) as u8),
+                        Color32::from_rgba_unmultiplied(12, 12, 14, (238.0 * oe) as u8),
                     );
 
                     ui.scope_builder(egui::UiBuilder::new().max_rect(orect), |ui| {
                         ui.set_opacity(oe);
                         let tab_h = 36.0;
                         let tab_w = ow / 3.0;
-                        ui.painter().rect_filled(
-                            Rect::from_min_size(orect.min, Vec2::new(ow, tab_h)),
-                            CornerRadius::ZERO,
-                            Color32::from_rgba_unmultiplied(255, 255, 255, 8),
-                        );
 
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::ZERO;
@@ -2208,22 +2457,7 @@ impl StreamdApp {
                                                 }
                                             }
                                             ui.add_space(8.0);
-                                            if ui
-                                                .add_sized(
-                                                    Vec2::new(row_w, 28.0),
-                                                    egui::Button::new(
-                                                        egui::RichText::new(
-                                                            "More Audio Options  >",
-                                                        )
-                                                        .size(12.0)
-                                                        .color(Color32::WHITE),
-                                                    )
-                                                    .fill(Color32::from_rgba_unmultiplied(
-                                                        255, 255, 255, 14,
-                                                    )),
-                                                )
-                                                .clicked()
-                                            {
+                                            if more_options_row(ui, row_w, "More options") {
                                                 self.studio_tab = Some(OptTab::Audio);
                                                 self.opts_open = false;
                                             }
@@ -2333,27 +2567,60 @@ impl StreamdApp {
                                                 }
                                             }
                                             ui.add_space(8.0);
-                                            if ui
-                                                .add_sized(
-                                                    Vec2::new(row_w, 28.0),
-                                                    egui::Button::new(
-                                                        egui::RichText::new(
-                                                            "More Subtitle Options  >",
-                                                        )
-                                                        .size(12.0)
-                                                        .color(Color32::WHITE),
-                                                    )
-                                                    .fill(Color32::from_rgba_unmultiplied(
-                                                        255, 255, 255, 14,
-                                                    )),
-                                                )
-                                                .clicked()
-                                            {
+                                            if more_options_row(ui, row_w, "More options") {
                                                 self.studio_tab = Some(OptTab::Subs);
                                                 self.opts_open = false;
                                             }
                                         }
                                         OptTab::Video => {
+                                            ui.label(
+                                                egui::RichText::new("Quality")
+                                                    .size(11.5)
+                                                    .color(Color32::from_gray(145)),
+                                            );
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                                                let qs = [
+                                                    (0i64, "Original"),
+                                                    (1080, "1080p"),
+                                                    (720, "720p"),
+                                                    (480, "480p"),
+                                                ];
+                                                let bw = (row_w - 12.0) / 4.0;
+                                                for (cap, lbl) in qs {
+                                                    let active = self.quality_cap == cap;
+                                                    if ui
+                                                        .add_sized(
+                                                            Vec2::new(bw, 26.0),
+                                                            egui::Button::new(
+                                                                egui::RichText::new(lbl)
+                                                                    .size(11.0)
+                                                                    .color(if active {
+                                                                        Color32::BLACK
+                                                                    } else {
+                                                                        Color32::from_gray(190)
+                                                                    }),
+                                                            )
+                                                            .fill(if active {
+                                                                Color32::WHITE
+                                                            } else {
+                                                                Color32::from_rgba_unmultiplied(
+                                                                    255, 255, 255, 14,
+                                                                )
+                                                            }),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.quality_cap = cap;
+                                                        if let Some(m) = &mpv {
+                                                            m.set_video_quality_cap(cap);
+                                                        }
+                                                        self.flash(lbl);
+                                                    }
+                                                }
+                                            });
+
+                                            ui.add_space(6.0);
                                             ui.label(
                                                 egui::RichText::new("Playback Speed")
                                                     .size(11.5)
@@ -2451,22 +2718,7 @@ impl StreamdApp {
                                             });
 
                                             ui.add_space(10.0);
-                                            if ui
-                                                .add_sized(
-                                                    Vec2::new(row_w, 28.0),
-                                                    egui::Button::new(
-                                                        egui::RichText::new(
-                                                            "More Video Options  >",
-                                                        )
-                                                        .size(12.0)
-                                                        .color(Color32::WHITE),
-                                                    )
-                                                    .fill(Color32::from_rgba_unmultiplied(
-                                                        255, 255, 255, 14,
-                                                    )),
-                                                )
-                                                .clicked()
-                                            {
+                                            if more_options_row(ui, row_w, "More options") {
                                                 self.studio_tab = Some(OptTab::Video);
                                                 self.opts_open = false;
                                             }
@@ -3262,6 +3514,14 @@ impl StreamdApp {
 
 impl eframe::App for StreamdApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Receive decoded Cover-Flow card thumbnails
+        while let Ok((src_key, ci)) = self.card_thumb_rx.try_recv() {
+            let tex = ctx.load_texture(format!("card_{src_key}"), ci, TextureOptions::LINEAR);
+            if let Some(item) = self.library.iter_mut().find(|x| x.source == src_key) {
+                item.thumb = Some(tex);
+            }
+        }
+
         self.handle_dropped_files(ctx);
 
         if let Some(rx) = &self.open_rx {
